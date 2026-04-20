@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: shopify-tracking-app
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: SHOPIFY_API_KEY
+        sync: false
+      - key: SHOPIFY_API_SECRET
+        sync: false
+      - key: SHOPIFY_STORE
+        sync: false
+      - key: SHOPIFY_ACCESS_TOKEN
+        sync: false
+      - key: FLOW_WEBHOOK_SECRET
+        sync: false
+      - key: ARAMEX_USERNAME
+        sync: false
+      - key: ARAMEX_PASSWORD
+        sync: false
+      - key: ARAMEX_ACCOUNT_NUM
+        sync: false
+      - key: ARAMEX_ACCOUNT_PIN
+        sync: false
+      - key: ARAMEX_ACCOUNT_ENTITY
+        sync: false
+      - key: ARAMEX_ACCOUNT_COUNTRY
+        value: AE
+      - key: FLASK_SECRET
+        sync: false
