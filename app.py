@@ -77,7 +77,7 @@ def get_fulfilled_undelivered_orders():
     orders = []
     url = shopify_url("orders.json")
     params = {
-        "status": "open",
+        "status": "any`",
         "fulfillment_status": "fulfilled",
         "limit": 250,
         "fields": "id,name,fulfillments,metafields",
