@@ -410,3 +410,68 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     print(f"Starting Flask server on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
+
+# ─── OAuth callback — run this ONCE to get your access token ──────────────────
+# After getting the token, you can remove this route if you want.
+@app.route("/auth/callback")
+def auth_callback():
+    """
+    Shopify redirects here after you approve the app install.
+    Exchanges the code for a permanent access token and displays it.
+    Visit: https://devfragrantsouq.myshopify.com/admin/oauth/authorize?
+           client_id=cf7a897a6e11a0c301b321f8345fe861&
+           scope=read_orders,write_orders,read_fulfillments,write_fulfillments,
+                 read_metafields,write_metafields&
+           redirect_uri=https://delivery-tracker-m427.onrender.com/auth/callback
+    """
+    code  = request.args.get("code")
+    shop  = request.args.get("shop")
+    error = request.args.get("error")
+
+    print(f"\n>>> /auth/callback received")
+    print(f"    shop  = {shop}")
+    print(f"    code  = {code}")
+    print(f"    error = {error}")
+
+    if error:
+        return f"<h2>Error: {error}</h2>", 400
+
+    if not code:
+        return "<h2>No code received. Did you visit the correct OAuth URL?</h2>", 400
+
+    # Exchange code for permanent access token
+    print(f"    Exchanging code for access token...")
+    resp = requests.post(
+        f"https://{shop}/admin/oauth/access_token",
+        json={
+            "client_id":     SHOPIFY_API_KEY,
+            "client_secret": SHOPIFY_API_SECRET,
+            "code":          code,
+        },
+        timeout=15,
+    )
+    print(f"    Shopify token exchange response: HTTP {resp.status_code}")
+    data  = resp.json()
+    token = data.get("access_token", "")
+
+    if token:
+        print(f"\n{'='*60}")
+        print(f"YOUR ACCESS TOKEN (copy this into Render env vars):")
+        print(f"{token}")
+        print(f"{'='*60}\n")
+        return f"""
+        <html><body style="font-family:sans-serif;padding:40px;background:#f0fdf4">
+        <h2 style="color:#166534">Access token obtained successfully!</h2>
+        <p>Copy this token and add it to your Render environment variables as
+        <strong>SHOPIFY_ACCESS_TOKEN</strong>:</p>
+        <div style="background:#fff;border:2px solid #16a34a;border-radius:8px;
+                    padding:16px;font-family:monospace;font-size:14px;
+                    word-break:break-all;margin:16px 0">{token}</div>
+        <p style="color:#666">This page also printed the token to your Render logs.<br>
+        After saving the token, you can remove the /auth/callback route from app.py</p>
+        </body></html>
+        """
+    else:
+        print(f"    Token exchange failed: {data}")
+        return f"<h2>Token exchange failed</h2><pre>{data}</pre>", 400
