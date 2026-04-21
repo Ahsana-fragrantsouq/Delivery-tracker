@@ -15,17 +15,5 @@ services:
         sync: false
       - key: FLOW_WEBHOOK_SECRET
         sync: false
-      - key: ARAMEX_USERNAME
-        sync: false
-      - key: ARAMEX_PASSWORD
-        sync: false
-      - key: ARAMEX_ACCOUNT_NUM
-        sync: false
-      - key: ARAMEX_ACCOUNT_PIN
-        sync: false
-      - key: ARAMEX_ACCOUNT_ENTITY
-        sync: false
-      - key: ARAMEX_ACCOUNT_COUNTRY
-        value: AE
       - key: FLASK_SECRET
         sync: false
