@@ -24,12 +24,7 @@ SHOPIFY_STORE      = os.getenv("SHOPIFY_STORE")        # e.g. fragrantsouq.mysho
 ACCESS_TOKEN       = os.getenv("SHOPIFY_ACCESS_TOKEN") # long-lived token for custom app
 FLOW_WEBHOOK_SECRET = os.getenv("FLOW_WEBHOOK_SECRET", "") # optional shared secret
 
-ARAMEX_USERNAME    = os.getenv("ARAMEX_USERNAME", "")
-ARAMEX_PASSWORD    = os.getenv("ARAMEX_PASSWORD", "")
-ARAMEX_ACCOUNT_NUM = os.getenv("ARAMEX_ACCOUNT_NUM", "")
-ARAMEX_ACCOUNT_PIN = os.getenv("ARAMEX_ACCOUNT_PIN", "")
-ARAMEX_ACCOUNT_ENTITY   = os.getenv("ARAMEX_ACCOUNT_ENTITY", "")
-ARAMEX_ACCOUNT_COUNTRY  = os.getenv("ARAMEX_ACCOUNT_COUNTRY", "AE")
+# No Aramex credentials needed — we scrape the public tracking page
 
 # ─── Aramex tracking status map ───────────────────────────────────────────────
 # Maps Aramex UpdateCode → exact stage labels shown on aramex.com tracking page
@@ -181,46 +176,125 @@ def set_order_metafield(order_id, namespace, key, value):
     return resp.json()
 
 
-# ─── Aramex API ───────────────────────────────────────────────────────────────
+# ─── Aramex public page scraper (no credentials needed) ────────────────────
 def check_aramex_tracking(tracking_number: str) -> str:
     """
-    Call Aramex Tracking API and return the latest status string.
-    Returns 'Unknown' if anything fails.
+    Scrape the PUBLIC Aramex tracking page - zero credentials needed.
+    Same page you open in your browser:
+    https://www.aramex.com/us/en/track/track-results-new?type=EXP&ShipmentNumber=50799807774
+
+    4-method fallback chain:
+      1. Next.js embedded JSON (__NEXT_DATA__ script tag)
+      2. HTML elements with active/current CSS class
+      3. Full page text scan for stage keywords
+      4. Latest Update section text
     """
-    url = "https://ws.aramex.net/ShippingAPI.V2/Tracking/Service_1_0.svc/json/TrackShipments"
-    payload = {
-        "ClientInfo": {
-            "UserName": ARAMEX_USERNAME,
-            "Password": ARAMEX_PASSWORD,
-            "Version": "v1.0",
-            "AccountNumber": ARAMEX_ACCOUNT_NUM,
-            "AccountPin": ARAMEX_ACCOUNT_PIN,
-            "AccountEntity": ARAMEX_ACCOUNT_ENTITY,
-            "AccountCountryCode": ARAMEX_ACCOUNT_COUNTRY,
-            "Source": 24,
-        },
-        "Shipments": [tracking_number],
-        "GetLastTrackingUpdateOnly": True,
+    import json as _json
+    from bs4 import BeautifulSoup
+
+    url = (
+        "https://www.aramex.com/us/en/track/track-results-new"
+        f"?type=EXP&ShipmentNumber={tracking_number}"
+    )
+
+    # Browser-like headers so Aramex doesn't block the request
+    hdrs = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     }
+
+    # The 7 stages exactly as shown on aramex.com left-to-right
+    STAGES = [
+        "Created", "Collected", "Departed", "In transit",
+        "Arrived at destination", "Out for delivery", "Delivered",
+    ]
+
+    # Exception keywords to scan for in page text
+    EXCEPTIONS = {
+        "delivery attempted": "Delivery attempted",
+        "delivery attempt":   "Delivery attempted",
+        "nobody home":        "Delivery attempted",
+        "on hold":            "On hold",
+        "returned to sender": "Returned to sender",
+        "return to sender":   "Returned to sender",
+        "cancelled":          "Cancelled",
+        "shipment lost":      "Lost",
+    }
+
     try:
-        resp = requests.post(url, json=payload, timeout=15)
+        resp = requests.get(url, headers=hdrs, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
-        tracking_results = data.get("TrackingResults", [])
-        if not tracking_results:
-            return "No tracking data"
-        # Each result has a Value list with update entries
-        updates = tracking_results[0].get("Value", [])
-        if not updates:
-            return "No updates"
-        latest = updates[-1]  # most recent
-        code = latest.get("UpdateCode", "")
-        description = latest.get("UpdateDescription", "")
-        mapped = ARAMEX_STATUS_MAP.get(code, description or "In transit")
-        logger.info(f"Aramex {tracking_number}: {code} → {mapped}")
-        return mapped
+        html  = resp.text
+        soup  = BeautifulSoup(html, "html.parser")
+        lower = html.lower()
+
+        # Method 1 — Next.js __NEXT_DATA__ embedded JSON
+        tag = soup.find("script", id="__NEXT_DATA__")
+        if tag and tag.string:
+            try:
+                data    = _json.loads(tag.string)
+                as_str  = _json.dumps(data).lower()
+                found   = None
+                for stage in STAGES:
+                    if stage.lower() in as_str:
+                        found = stage          # keep iterating — last match = furthest stage
+                if found:
+                    logger.info(f"Aramex {tracking_number}: JSON → {found}")
+                    return found
+            except Exception as je:
+                logger.debug(f"JSON parse: {je}")
+
+        # Method 2 — HTML elements carrying active/current/selected class
+        for cls_kw in ["active", "current", "selected", "highlighted"]:
+            els = soup.find_all(
+                class_=lambda c, k=cls_kw: c and k in " ".join(c).lower()
+            )
+            for el in els:
+                text = el.get_text(separator=" ", strip=True).lower()
+                for stage in reversed(STAGES):
+                    if stage.lower() in text:
+                        logger.info(f"Aramex {tracking_number}: HTML class → {stage}")
+                        return stage
+
+        # Method 3 — exception keywords scan
+        for kw, status in EXCEPTIONS.items():
+            if kw in lower:
+                logger.info(f"Aramex {tracking_number}: exception kw → {status}")
+                return status
+
+        # Method 4 — full text scan: last stage present in page = current stage
+        found = None
+        for stage in STAGES:
+            if stage.lower() in lower:
+                found = stage
+        if found:
+            logger.info(f"Aramex {tracking_number}: text scan → {found}")
+            return found
+
+        # Method 5 — "Latest Update" section text (raw description)
+        for tag in soup.find_all(string=lambda t: t and "latest update" in t.lower()):
+            parent = tag.find_parent()
+            if parent:
+                sibling = parent.find_next_sibling()
+                if sibling:
+                    txt = sibling.get_text(strip=True)
+                    if txt:
+                        logger.info(f"Aramex {tracking_number}: latest-update text")
+                        return txt[:80]
+
+        logger.warning(f"Aramex {tracking_number}: status undetermined, defaulting to In transit")
+        return "In transit"
+
+    except requests.exceptions.Timeout:
+        logger.error(f"Aramex page timeout for {tracking_number}")
+        return "Tracking error"
     except Exception as e:
-        logger.error(f"Aramex API error for {tracking_number}: {e}")
+        logger.error(f"Aramex scraping error for {tracking_number}: {e}")
         return "Tracking error"
 
 
@@ -331,7 +405,87 @@ def manual_check():
     return jsonify({"ok": True, "results": results})
 
 
+# ─── Embedded App UI ──────────────────────────────────────────────────────────
+EMBEDDED_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tracking Checker</title>
+  <script src="https://unpkg.com/@shopify/app-bridge@3"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           margin: 0; padding: 24px; background: #f6f6f7; color: #202223; }
+    .card { background: #fff; border-radius: 8px; border: 1px solid #e1e3e5;
+            padding: 20px 24px; margin-bottom: 16px; }
+    h2 { margin: 0 0 4px; font-size: 16px; font-weight: 600; }
+    p  { margin: 4px 0 0; color: #6d7175; font-size: 14px; }
+    button { background: #008060; color: #fff; border: none; border-radius: 6px;
+             padding: 10px 20px; font-size: 14px; cursor: pointer; margin-top: 12px; }
+    button:hover { background: #006e52; }
+    button:disabled { background: #b5b5b5; cursor: not-allowed; }
+    #result { margin-top: 12px; font-size: 14px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px;
+             font-size: 12px; font-weight: 500; }
+    .badge.ok  { background: #d4edda; color: #155724; }
+    .badge.err { background: #f8d7da; color: #721c24; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #e1e3e5; }
+    th { font-weight: 500; color: #6d7175; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Auto Tracking Checker</h2>
+    <p>Runs automatically at 8:00 AM and 6:00 PM via Shopify Flow. You can also trigger it manually.</p>
+    <button id="runBtn" onclick="runCheck()">Run Check Now</button>
+    <div id="result"></div>
+  </div>
 
+  <div class="card">
+    <h2>How it works</h2>
+    <table>
+      <tr><th>Step</th><th>What happens</th></tr>
+      <tr><td>1</td><td>Shopify Flow fires at 8am &amp; 6pm</td></tr>
+      <tr><td>2</td><td>Flask app fetches all fulfilled, non-delivered orders</td></tr>
+      <tr><td>3</td><td>For each order, checks tracking via Aramex API</td></tr>
+      <tr><td>4</td><td>Updates the <code>custom.delivery_status</code> metafield on the order</td></tr>
+      <tr><td>5</td><td>Delivery status column in Orders page updates automatically</td></tr>
+    </table>
+  </div>
+
+  <script>
+    async function runCheck() {
+      const btn = document.getElementById('runBtn');
+      const res = document.getElementById('result');
+      btn.disabled = true;
+      btn.textContent = 'Running…';
+      res.innerHTML = '';
+      try {
+        const r = await fetch('/check-tracking/manual');
+        const data = await r.json();
+        const { checked, updated, errors } = data.results || {};
+        res.innerHTML = `
+          <span class="badge ok">Done</span>
+          Checked <b>${checked}</b> orders &mdash; Updated <b>${updated}</b>
+          ${errors && errors.length ? `<br><span class="badge err">${errors.length} error(s)</span> ${errors.join(', ')}` : ''}
+        `;
+      } catch(e) {
+        res.innerHTML = `<span class="badge err">Error: ${e.message}</span>`;
+      }
+      btn.disabled = false;
+      btn.textContent = 'Run Check Now';
+    }
+  </script>
+</body>
+</html>
+"""
+
+@app.route("/app")
+def embedded_app():
+    """The embedded app page shown inside Shopify Admin."""
+    return render_template_string(EMBEDDED_HTML)
 
 
 if __name__ == "__main__":
