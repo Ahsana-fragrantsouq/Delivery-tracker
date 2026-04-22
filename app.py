@@ -63,12 +63,12 @@ TERMINAL_STATES = {"Delivered", "Returned to sender", "Cancelled", "Lost"}
 
 # ─── Shopify API helpers ───────────────────────────────────────────────────────
 def shopify_headers():
+    token = os.getenv("SHOPIFY_ACCESS_TOKEN")  # Read fresh every time
     return {
-        "X-Shopify-Access-Token": ACCESS_TOKEN,  # ✅ This looks correct
+        "X-Shopify-Access-Token": token,
         "Content-Type": "application/json",
     }
 
-    
 
 def shopify_url(path):
     return f"https://{SHOPIFY_STORE}/admin/api/2026-04/{path}"
@@ -422,6 +422,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     print(f"Starting Flask server on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 @app.route("/auth")
