@@ -459,8 +459,21 @@ def auth_callback():
         timeout=15,
     )
     print(f"    Shopify token exchange response: HTTP {resp.status_code}")
-    data  = resp.json()
-    token = data.get("access_token", "")
+    print(f"    FULL RAW RESPONSE: {resp.text}")
+    try:
+        data = resp.json()
+    except Exception as je:
+        print(f"    JSON parse error: {je}")
+        return f"<h2>JSON error: {je}</h2><pre>{resp.text}</pre>", 500
+    print(f"    All keys in response: {list(data.keys())}")
+    # Try all possible token fields
+    token = (
+        data.get("access_token") or
+        data.get("token") or
+        data.get("admin_api_access_token") or
+        ""
+    )
+    print(f"    Token found: {token[:20] if token else 'NONE'}...")
 
     if token:
         print(f"\n{'='*60}")
