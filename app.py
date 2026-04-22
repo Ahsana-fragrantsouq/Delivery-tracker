@@ -69,7 +69,8 @@ def shopify_headers():
     }
 
 def shopify_url(path):
-    return f"https://{SHOPIFY_STORE}/admin/api/2024-04/{path}"
+    return f"https://{SHOPIFY_STORE}/admin/api/2026-04/{path}"
+
 
 
 def get_fulfilled_undelivered_orders():
