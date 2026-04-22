@@ -80,7 +80,7 @@ def get_fulfilled_undelivered_orders():
     orders = []
     url = shopify_url("orders.json")
     params = {
-        "status": "any",   # open + closed/archived — fulfilled orders are often archived
+        
         "fulfillment_status": "fulfilled",
         "limit": 250,
         "fields": "id,name,fulfillments,metafields",
