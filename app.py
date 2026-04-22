@@ -522,3 +522,22 @@ def callback():
     
     # Save token to environment or database
     return f"Token received: {token}"
+
+@app.route("/test-token")
+def test_token():
+    import requests
+    
+    shop = "devfragrantsouq.myshopify.com"
+    token = os.environ.get("SHOPIFY_ACCESS_TOKEN")
+    
+    # Test 1: Get ALL orders (no filters)
+    url = f"https://{shop}/admin/api/2026-04/orders.json?limit=5&status=any"
+    headers = {"X-Shopify-Access-Token": token}
+    
+    response = requests.get(url, headers=headers)
+    
+    return {
+        "token_preview": token[:15] if token else "NOT SET",
+        "status_code": response.status_code,
+        "response": response.json()
+    }
