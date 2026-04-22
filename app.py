@@ -465,3 +465,17 @@ def test_scopes():
     
     response = requests.get(url, headers=headers)
     return response.json()
+@app.route("/test-orders")
+def test_orders():
+    token = os.getenv("SHOPIFY_ACCESS_TOKEN")
+    shop = os.getenv("SHOPIFY_STORE")
+    
+    url = f"https://{shop}/admin/api/2026-04/orders.json?fulfillment_status=fulfilled&limit=5"
+    headers = {"X-Shopify-Access-Token": token}
+    
+    resp = requests.get(url, headers=headers)
+    return {
+        "status_code": resp.status_code,
+        "order_count": len(resp.json().get("orders", [])),
+        "raw": resp.json()
+    }
