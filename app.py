@@ -1,11 +1,11 @@
 import os
 import logging
 import json as _json
-
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify,redirect
 from dotenv import load_dotenv
+import hashlib, hmac, os
 
 load_dotenv()
 
@@ -25,6 +25,8 @@ SHOPIFY_API_SECRET  = os.getenv("SHOPIFY_API_SECRET")
 SHOPIFY_STORE       = os.getenv("SHOPIFY_STORE")
 ACCESS_TOKEN        = os.getenv("SHOPIFY_ACCESS_TOKEN")
 FLOW_WEBHOOK_SECRET = os.getenv("FLOW_WEBHOOK_SECRET", "")
+SCOPES = "read_orders,read_fulfillments"
+REDIRECT_URI = "https://delivery-tracker-m427.onrender.com/auth/callback"
 
 print("=" * 60)
 print("DELIVERY TRACKER — STARTING UP")
@@ -421,77 +423,101 @@ if __name__ == "__main__":
 
 # ─── OAuth callback — run this ONCE to get your access token ──────────────────
 # After getting the token, you can remove this route if you want.
+# @app.route("/auth/callback")
+# def auth_callback():
+#     """
+#     Shopify redirects here after you approve the app install.
+#     Exchanges the code for a permanent access token and displays it.
+#     Visit: https://devfragrantsouq.myshopify.com/admin/oauth/authorize?
+#            client_id=cf7a897a6e11a0c301b321f8345fe861&
+#            scope=read_orders,write_orders,read_fulfillments,write_fulfillments,
+#                  read_metafields,write_metafields&
+#            redirect_uri=https://delivery-tracker-m427.onrender.com/auth/callback
+#     """
+#     code  = request.args.get("code")
+#     shop  = request.args.get("shop")
+#     error = request.args.get("error")
+
+#     print(f"\n>>> /auth/callback received")
+#     print(f"    shop  = {shop}")
+#     print(f"    code  = {code}")
+#     print(f"    error = {error}")
+
+#     if error:
+#         return f"<h2>Error: {error}</h2>", 400
+
+#     if not code:
+#         return "<h2>No code received. Did you visit the correct OAuth URL?</h2>", 400
+
+#     # Exchange code for permanent access token
+#     print(f"    Exchanging code for access token...")
+#     resp = requests.post(
+#         f"https://{shop}/admin/oauth/access_token",
+#         json={
+#             "client_id":     SHOPIFY_API_KEY,
+#             "client_secret": SHOPIFY_API_SECRET,
+#             "code":          code,
+#         },
+#         timeout=15,
+#     )
+#     print(f"    Shopify token exchange response: HTTP {resp.status_code}")
+#     print(f"    FULL RAW RESPONSE: {resp.text}")
+#     try:
+#         data = resp.json()
+#     except Exception as je:
+#         print(f"    JSON parse error: {je}")
+#         return f"<h2>JSON error: {je}</h2><pre>{resp.text}</pre>", 500
+#     print(f"    All keys in response: {list(data.keys())}")
+#     # Try all possible token fields
+#     token = (
+#         data.get("access_token") or
+#         data.get("token") or
+#         data.get("admin_api_access_token") or
+#         ""
+#     )
+#     print(f"    Token found: {token[:20] if token else 'NONE'}...")
+
+#     if token:
+#         print(f"\n{'='*60}")
+#         print(f"YOUR ACCESS TOKEN (copy this into Render env vars):")
+#         print(f"{token}")
+#         print(f"{'='*60}\n")
+#         return f"""
+#         <html><body style="font-family:sans-serif;padding:40px;background:#f0fdf4">
+#         <h2 style="color:#166534">Access token obtained successfully!</h2>
+#         <p>Copy this token and add it to your Render environment variables as
+#         <strong>SHOPIFY_ACCESS_TOKEN</strong>:</p>
+#         <div style="background:#fff;border:2px solid #16a34a;border-radius:8px;
+#                     padding:16px;font-family:monospace;font-size:14px;
+#                     word-break:break-all;margin:16px 0">{token}</div>
+#         <p style="color:#666">This page also printed the token to your Render logs.<br>
+#         After saving the token, you can remove the /auth/callback route from app.py</p>
+#         </body></html>
+#         """
+#     else:
+#         print(f"    Token exchange failed: {data}")
+#         return f"<h2>Token exchange failed</h2><pre>{data}</pre>", 400
+
+@app.route("/auth")
+def auth():
+    shop = request.args.get("shop")
+    auth_url = f"https://{shop}/admin/oauth/authorize?client_id={SHOPIFY_API_KEY}&scope={SCOPES}&redirect_uri={REDIRECT_URI}"
+    return redirect(auth_url)
+
 @app.route("/auth/callback")
-def auth_callback():
-    """
-    Shopify redirects here after you approve the app install.
-    Exchanges the code for a permanent access token and displays it.
-    Visit: https://devfragrantsouq.myshopify.com/admin/oauth/authorize?
-           client_id=cf7a897a6e11a0c301b321f8345fe861&
-           scope=read_orders,write_orders,read_fulfillments,write_fulfillments,
-                 read_metafields,write_metafields&
-           redirect_uri=https://delivery-tracker-m427.onrender.com/auth/callback
-    """
-    code  = request.args.get("code")
-    shop  = request.args.get("shop")
-    error = request.args.get("error")
-
-    print(f"\n>>> /auth/callback received")
-    print(f"    shop  = {shop}")
-    print(f"    code  = {code}")
-    print(f"    error = {error}")
-
-    if error:
-        return f"<h2>Error: {error}</h2>", 400
-
-    if not code:
-        return "<h2>No code received. Did you visit the correct OAuth URL?</h2>", 400
-
-    # Exchange code for permanent access token
-    print(f"    Exchanging code for access token...")
-    resp = requests.post(
-        f"https://{shop}/admin/oauth/access_token",
-        json={
-            "client_id":     SHOPIFY_API_KEY,
-            "client_secret": SHOPIFY_API_SECRET,
-            "code":          code,
-        },
-        timeout=15,
-    )
-    print(f"    Shopify token exchange response: HTTP {resp.status_code}")
-    print(f"    FULL RAW RESPONSE: {resp.text}")
-    try:
-        data = resp.json()
-    except Exception as je:
-        print(f"    JSON parse error: {je}")
-        return f"<h2>JSON error: {je}</h2><pre>{resp.text}</pre>", 500
-    print(f"    All keys in response: {list(data.keys())}")
-    # Try all possible token fields
-    token = (
-        data.get("access_token") or
-        data.get("token") or
-        data.get("admin_api_access_token") or
-        ""
-    )
-    print(f"    Token found: {token[:20] if token else 'NONE'}...")
-
-    if token:
-        print(f"\n{'='*60}")
-        print(f"YOUR ACCESS TOKEN (copy this into Render env vars):")
-        print(f"{token}")
-        print(f"{'='*60}\n")
-        return f"""
-        <html><body style="font-family:sans-serif;padding:40px;background:#f0fdf4">
-        <h2 style="color:#166534">Access token obtained successfully!</h2>
-        <p>Copy this token and add it to your Render environment variables as
-        <strong>SHOPIFY_ACCESS_TOKEN</strong>:</p>
-        <div style="background:#fff;border:2px solid #16a34a;border-radius:8px;
-                    padding:16px;font-family:monospace;font-size:14px;
-                    word-break:break-all;margin:16px 0">{token}</div>
-        <p style="color:#666">This page also printed the token to your Render logs.<br>
-        After saving the token, you can remove the /auth/callback route from app.py</p>
-        </body></html>
-        """
-    else:
-        print(f"    Token exchange failed: {data}")
-        return f"<h2>Token exchange failed</h2><pre>{data}</pre>", 400
+def callback():
+    code = request.args.get("code")
+    shop = request.args.get("shop")
+    
+    # Exchange code for access token
+    response = requests.post(f"https://{shop}/admin/oauth/access_token", json={
+        "client_id": SHOPIFY_API_KEY,
+        "client_secret": SHOPIFY_API_SECRET,
+        "code": code
+    })
+    
+    token = response.json().get("access_token")  # This is your shpat_ token!
+    print(f"ACCESS TOKEN: {token}")  # Check Render logs for this
+    
+    # Save token to environment or database
+    return f"Token received: {token}"
