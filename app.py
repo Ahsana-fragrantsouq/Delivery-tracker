@@ -76,6 +76,10 @@ def shopify_url(path):
 
 
 def get_fulfilled_undelivered_orders():
+    token = os.getenv("SHOPIFY_ACCESS_TOKEN")
+
+    print(f"Token being used: {token[:20] if token else 'NOT SET!'}")
+
     print("\n── STEP 1: Fetching fulfilled orders from Shopify ──")
     logger.info("Calling Shopify Admin API → GET /orders.json")
 
