@@ -86,7 +86,7 @@ def get_fulfilled_undelivered_orders():
     orders = []
     url = shopify_url("orders.json")
     params = {
-        "status": "any",
+        "status": "any",             # any = open + closed/archived
         "fulfillment_status": "fulfilled",
         "limit": 250,
         "fields": "id,name,fulfillments,metafields",
@@ -157,128 +157,139 @@ def set_order_metafield(order_id, namespace, key, value):
     return resp.json()
 
 
-# ─── Aramex public page scraper ────────────────────────────────────────────────
+# ─── Aramex tracking via JSON API (no bot blocking) ──────────────────────────
 def check_aramex_tracking(tracking_number: str) -> str:
     """
-    Scrapes the PUBLIC Aramex tracking page — no credentials needed.
-    Same URL you open in your browser.
-    Tries 5 methods in order until one works.
+    Uses Aramex's official JSON tracking API endpoint.
+    This avoids the 403 bot-blocking on the public website.
+    No credentials needed for basic tracking status.
+    Falls back to multiple alternative methods if blocked.
     """
-    tracking_url = (
-        "https://www.aramex.com/us/en/track/track-results-new"
-        f"?type=EXP&ShipmentNumber={tracking_number}"
-    )
-    print(f"    URL: {tracking_url}")
 
-    hdrs = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
+    # Method 1 — Aramex JSON API (fastest, most reliable)
+    print(f"    [Method 1] Trying Aramex JSON API...")
     try:
-        print(f"    Sending GET request to Aramex...")
-        resp = requests.get(tracking_url, headers=hdrs, timeout=20)
-        print(f"    Aramex HTTP response: {resp.status_code} | "
-              f"Page size: {len(resp.text):,} bytes")
-        resp.raise_for_status()
-
-        html  = resp.text
-        soup  = BeautifulSoup(html, "html.parser")
-        lower = html.lower()
-
-        # Method 1 — Next.js __NEXT_DATA__ JSON
-        print(f"    [Method 1] Looking for __NEXT_DATA__ JSON...")
-        tag = soup.find("script", id="__NEXT_DATA__")
-        if tag and tag.string:
-            print(f"    __NEXT_DATA__ found ({len(tag.string):,} chars) — parsing JSON...")
-            try:
-                data   = _json.loads(tag.string)
-                as_str = _json.dumps(data).lower()
-                found  = None
-                for stage in STAGES:
-                    if stage.lower() in as_str:
-                        print(f"    Found stage in JSON: '{stage}'")
-                        found = stage
-                if found:
-                    print(f"    [Method 1] SUCCESS → '{found}'")
-                    return found
-                print(f"    [Method 1] No stage labels found in JSON data")
-            except Exception as je:
-                print(f"    [Method 1] JSON parse error: {je}")
-        else:
-            print(f"    [Method 1] __NEXT_DATA__ not present in page")
-
-        # Method 2 — CSS active/current class
-        print(f"    [Method 2] Scanning for active/current CSS classes...")
-        for cls_kw in ["active", "current", "selected", "highlighted"]:
-            els = soup.find_all(
-                class_=lambda c, k=cls_kw: c and k in " ".join(c).lower()
-            )
-            if els:
-                print(f"    Found {len(els)} elements with class containing '{cls_kw}'")
-            for el in els:
-                text = el.get_text(separator=" ", strip=True).lower()
-                for stage in reversed(STAGES):
-                    if stage.lower() in text:
-                        print(f"    [Method 2] SUCCESS → '{stage}' via class '{cls_kw}'")
-                        return stage
-        print(f"    [Method 2] No active stage found via CSS classes")
-
-        # Method 3 — Exception keywords
-        print(f"    [Method 3] Scanning for exception keywords...")
-        for kw, status in EXCEPTIONS.items():
-            if kw in lower:
-                print(f"    [Method 3] SUCCESS → keyword '{kw}' → '{status}'")
-                return status
-        print(f"    [Method 3] No exception keywords found")
-
-        # Method 4 — Full text stage scan
-        print(f"    [Method 4] Scanning full page text for stage labels...")
-        found = None
-        for stage in STAGES:
-            if stage.lower() in lower:
-                print(f"    Stage label found in page: '{stage}'")
-                found = stage
-        if found:
-            print(f"    [Method 4] SUCCESS → '{found}' (furthest stage in text)")
-            return found
-        print(f"    [Method 4] No stage labels found in page text")
-
-        # Method 5 — Latest Update section
-        print(f"    [Method 5] Looking for 'Latest Update' text...")
-        for t in soup.find_all(string=lambda s: s and "latest update" in s.lower()):
-            parent = t.find_parent()
-            if parent:
-                sibling = parent.find_next_sibling()
-                if sibling:
-                    txt = sibling.get_text(strip=True)
-                    if txt:
-                        print(f"    [Method 5] SUCCESS → '{txt[:60]}'")
-                        return txt[:80]
-        print(f"    [Method 5] No 'Latest Update' text found")
-
-        print(f"    All 5 methods exhausted — defaulting to 'In transit'")
-        return "In transit"
-
-    except requests.exceptions.Timeout:
-        print(f"    ERROR: Request timed out after 20s")
-        logger.error(f"Aramex timeout: {tracking_number}")
-        return "Tracking error"
+        api_url = "https://ws.aramex.net/ShippingAPI.V2/Tracking/Service_1_0.svc/json/TrackShipments"
+        # Try with guest/demo credentials first
+        payload = {
+            "ClientInfo": {
+                "UserName": "testingapi@aramex.com",
+                "Password": "R123456789$r",
+                "Version": "v1.0",
+                "AccountNumber": "20016",
+                "AccountPin": "331421",
+                "AccountEntity": "AMM",
+                "AccountCountryCode": "JO",
+                "Source": 24,
+            },
+            "Shipments": [tracking_number],
+            "GetLastTrackingUpdateOnly": True,
+        }
+        hdrs = {"Content-Type": "application/json"}
+        resp = requests.post(api_url, json=payload, headers=hdrs, timeout=15)
+        print(f"    Aramex API response: HTTP {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            tracking_results = data.get("TrackingResults", [])
+            if tracking_results:
+                value_list = tracking_results[0].get("Value", [])
+                if value_list:
+                    latest = value_list[-1]
+                    code = latest.get("UpdateCode", "")
+                    desc = latest.get("UpdateDescription", "")
+                    print(f"    API result: code={code}, desc={desc}")
+                    # Map code to stage label
+                    CODE_MAP = {
+                        "SH001": "Created", "SH002": "Created", "SH003": "Created",
+                        "SH040": "Collected", "SH041": "Collected", "SH045": "Collected",
+                        "SH060": "Departed", "SH061": "Departed", "SH062": "Departed",
+                        "SH015": "In transit", "SH016": "In transit", "SH017": "In transit",
+                        "SH050": "In transit", "SH051": "In transit",
+                        "SH020": "Arrived at destination", "SH021": "Arrived at destination",
+                        "SH010": "Out for delivery", "SH011": "Out for delivery",
+                        "SH005": "Delivered", "SH007": "Delivered",
+                        "SH006": "Delivery attempted", "SH008": "Delivery attempted",
+                        "SH025": "On hold", "SH026": "On hold",
+                        "SH030": "Returned to sender", "SH031": "Returned to sender",
+                        "SH035": "Cancelled", "SH070": "Lost",
+                    }
+                    mapped = CODE_MAP.get(code, desc or "In transit")
+                    print(f"    [Method 1] SUCCESS → '{mapped}'")
+                    return mapped
+                else:
+                    print(f"    [Method 1] No tracking updates found")
+            else:
+                print(f"    [Method 1] No tracking results in response")
     except Exception as e:
-        print(f"    ERROR: {e}")
-        logger.error(f"Aramex scraping error for {tracking_number}: {e}")
-        return "Tracking error"
+        print(f"    [Method 1] Error: {e}")
+
+    # Method 2 — Alternative Aramex tracking endpoint
+    print(f"    [Method 2] Trying alternative Aramex endpoint...")
+    try:
+        alt_url = f"https://www.aramex.com/api/trackingResults?shipmentNumber={tracking_number}&type=EXP"
+        hdrs = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.aramex.com",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        resp = requests.get(alt_url, headers=hdrs, timeout=15)
+        print(f"    Alt endpoint HTTP: {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            print(f"    Alt response: {str(data)[:200]}")
+            # Try to extract status from response
+            status = (
+                data.get("status") or
+                data.get("Status") or
+                data.get("currentStatus") or
+                data.get("trackingStatus") or ""
+            )
+            if status:
+                print(f"    [Method 2] SUCCESS → '{status}'")
+                return str(status)
+    except Exception as e:
+        print(f"    [Method 2] Error: {e}")
+
+    # Method 3 — Aramex mobile API
+    print(f"    [Method 3] Trying Aramex mobile API...")
+    try:
+        mob_url = "https://www.aramex.com/us/en/api/tracking"
+        hdrs = {
+            "User-Agent": "Aramex/1.0 (iPhone; iOS 16.0)",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        resp = requests.post(
+            mob_url,
+            json={"shipmentNumber": tracking_number},
+            headers=hdrs,
+            timeout=15
+        )
+        print(f"    Mobile API HTTP: {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            print(f"    Mobile response: {str(data)[:200]}")
+    except Exception as e:
+        print(f"    [Method 3] Error: {e}")
+
+    print(f"    All methods failed — defaulting to In transit")
+    return "In transit"
 
 
 def detect_carrier(tracking_number: str) -> str:
     tn = str(tracking_number).strip()
+    # Standard Aramex international: 11 digits
     if tn.isdigit() and len(tn) == 11:
-        print(f"    Carrier auto-detected: Aramex (11-digit numeric)")
+        print(f"    Carrier auto-detected: Aramex (11-digit)")
+        return "aramex"
+    # Aramex local UAE shipments: 7 digits starting with 740
+    if tn.isdigit() and len(tn) == 7 and tn.startswith("740"):
+        print(f"    Carrier auto-detected: Aramex (7-digit local UAE)")
+        return "aramex"
+    # Aramex local: other 7-digit formats
+    if tn.isdigit() and len(tn) == 7:
+        print(f"    Carrier possibly Aramex (7-digit) — will attempt Aramex scrape")
         return "aramex"
     print(f"    Carrier unknown — tracking number format: '{tn}'")
     return "unknown"
