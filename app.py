@@ -437,20 +437,27 @@ def auth():
 
 @app.route("/auth/callback")
 def callback():
+    # Debug: print all params received
+    print(f"Callback params: {request.args}")
+    
     code = request.args.get("code")
     shop = request.args.get("shop")
     
-    # Exchange code for access token
-    response = requests.post(f"https://{shop}/admin/oauth/access_token", json={
+    print(f"Shop: {shop}")
+    print(f"Code: {code}")
+    
+    if not shop or not code:
+        return f"Missing params! shop={shop}, code={code}", 400
+    
+    # Use data= not json=
+    response = requests.post(f"https://{shop}/admin/oauth/access_token", data={
         "client_id": SHOPIFY_API_KEY,
         "client_secret": SHOPIFY_API_SECRET,
         "code": code
     })
     
-    token = response.json().get("access_token")  # This is your shpat_ token!
-    print(f"ACCESS TOKEN: {token}")  # Check Render logs for this
-    
-    # Save token to environment or database
+    token = response.json().get("access_token")
+    print(f"ACCESS TOKEN: {token}")
     return f"Token received: {token}"
 
 @app.route("/test-scopes")
