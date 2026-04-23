@@ -364,16 +364,16 @@ def run_tracking_check():
         else:
             print(f"  Status changed: '{current_status}' → '{new_status}'")
             print(f"  Updating Shopify metafield...")
-            try:
-                set_order_metafield(order_id, "custom", "delivery_status", new_status)
-                print(f"  Shopify updated ✓")
-                logger.info(f"{order_name}: '{current_status}' → '{new_status}'")
-                results["updated"] += 1
-            except Exception as e:
-                err = f"{order_name}: update failed — {e}"
-                print(f"  ERROR: {err}")
-                logger.error(err)
-                results["errors"].append(err)
+            # try:
+            #     set_order_metafield(order_id, "custom", "delivery_status", new_status)
+            #     print(f"  Shopify updated ✓")
+            #     logger.info(f"{order_name}: '{current_status}' → '{new_status}'")
+            #     results["updated"] += 1
+            # except Exception as e:
+            #     err = f"{order_name}: update failed — {e}"
+            #     print(f"  ERROR: {err}")
+            #     logger.error(err)
+            #     results["errors"].append(err)
 
     print("\n" + "=" * 60)
     print("TRACKING CHECK COMPLETE")
