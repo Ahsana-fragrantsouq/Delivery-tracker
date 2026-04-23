@@ -145,17 +145,171 @@ def set_order_metafield(order_id, namespace, key, value):
     return resp.json()
 
 
+# ─── 17track universal tracker (free, supports Aramex + Professional Courier) ──
+def check_17track(tracking_number: str, carrier_code: int = 0) -> str:
+    """
+    Uses 17track.net free API to track any shipment.
+    Supports Aramex (code 190) and Professional Courier (code 2151).
+    Register free at https://www.17track.net/en/apiregistr
+    carrier_code=0 means auto-detect.
+    """
+    api_key = os.getenv("TRACK17_API_KEY", "")
+    if not api_key:
+        print(f"    17track: No API key set — skipping")
+        return ""
+
+    hdrs = {
+        "17token": api_key,
+        "Content-Type": "application/json",
+    }
+
+    # Step 1 — Register the tracking number
+    try:
+        print(f"    17track: Registering {tracking_number}...")
+        body = [{"number": tracking_number}]
+        if carrier_code:
+            body[0]["carrier"] = carrier_code
+        resp = requests.post(
+            "https://api.17track.net/track/v2.2/register",
+            json=body, headers=hdrs, timeout=15
+        )
+        print(f"    Register HTTP: {resp.status_code} | Body: {resp.text[:200]}")
+    except Exception as e:
+        print(f"    17track register error: {e}")
+
+    # Step 2 — Get tracking info
+    try:
+        print(f"    17track: Getting tracking info...")
+        resp = requests.post(
+            "https://api.17track.net/track/v2.2/gettrackinfo",
+            json=[{"number": tracking_number}],
+            headers=hdrs, timeout=15
+        )
+        print(f"    Getinfo HTTP: {resp.status_code} | Body: {resp.text[:500]}")
+        if resp.status_code == 200:
+            data     = resp.json()
+            accepted = data.get("data", {}).get("accepted", [])
+            if accepted:
+                track    = accepted[0].get("track", {})
+                e1       = track.get("e", 0)  # status code
+                z0       = track.get("z0", {})  # latest event
+                desc     = z0.get("z", "") if z0 else ""
+                print(f"    17track status code: {e1}, latest: {desc}")
+                # 17track status codes
+                STATUS_MAP_17 = {
+                    0:  "Not found",
+                    10: "In transit",
+                    20: "Expired",
+                    30: "Delivery attempted",
+                    35: "Out for delivery",
+                    40: "Delivered",
+                    50: "Returned to sender",
+                    60: "On hold",
+                }
+                status = STATUS_MAP_17.get(e1, "")
+                if status and status != "Not found":
+                    print(f"    17track SUCCESS → '{status}'")
+                    return status
+                if desc:
+                    print(f"    17track desc → '{desc[:50]}'")
+                    return desc[:50]
+            rejected = data.get("data", {}).get("rejected", [])
+            if rejected:
+                print(f"    17track rejected: {rejected}")
+    except Exception as e:
+        print(f"    17track getinfo error: {e}")
+
+    return ""
+
+
 # ─── Aramex tracking ──────────────────────────────────────────────────────────
 def check_aramex_tracking(tracking_number: str) -> str:
     """
-    Scrapes the PUBLIC Aramex tracking page — no credentials needed.
-    Tries 5 methods in order until one works.
+    Uses Aramex official tracking API at ws.aramex.net.
+    Credentials from environment variables (ARAMEX_USERNAME etc.)
+    Falls back to scraping if credentials not set.
     """
+    # ── Try official API first (most reliable) ────────────────────────────────
+    aramex_user   = os.getenv("ARAMEX_USERNAME", "")
+    aramex_pass   = os.getenv("ARAMEX_PASSWORD", "")
+    aramex_num    = os.getenv("ARAMEX_ACCOUNT_NUM", "")
+    aramex_pin    = os.getenv("ARAMEX_ACCOUNT_PIN", "")
+    aramex_entity = os.getenv("ARAMEX_ACCOUNT_ENTITY", "DXB")
+    aramex_country= os.getenv("ARAMEX_ACCOUNT_COUNTRY", "AE")
+
+    CODE_MAP = {
+        "SH001":"Created","SH002":"Created","SH003":"Created",
+        "SH040":"Collected","SH041":"Collected","SH045":"Collected",
+        "SH060":"Departed","SH061":"Departed","SH062":"Departed","SH065":"Departed",
+        "SH015":"In transit","SH016":"In transit","SH017":"In transit",
+        "SH050":"In transit","SH051":"In transit","SH055":"In transit",
+        "SH020":"Arrived at destination","SH021":"Arrived at destination","SH022":"Arrived at destination",
+        "SH010":"Out for delivery","SH011":"Out for delivery",
+        "SH005":"Delivered","SH007":"Delivered",
+        "SH006":"Delivery attempted","SH008":"Delivery attempted","SH009":"Delivery attempted",
+        "SH025":"On hold","SH026":"On hold",
+        "SH030":"Returned to sender","SH031":"Returned to sender","SH032":"Returned to sender",
+        "SH035":"Cancelled","SH070":"Lost",
+    }
+
+    # ── Try 17track first (free, no Aramex credentials needed) ─────────────────
+    result_17 = check_17track(tracking_number, carrier_code=190)  # 190 = Aramex
+    if result_17:
+        print(f"    17track result: '{result_17}'")
+        return result_17
+
+    # ── No credentials — return direct Aramex tracking URL ──────────────────
+    if not aramex_user:
+        tracking_link = f"https://www.aramex.com/us/en/track/track-results-new?type=EXP&ShipmentNumber={tracking_number}"
+        print(f"    Returning direct tracking URL: {tracking_link}")
+        return tracking_link
+
+    if aramex_user and aramex_pass:
+        print(f"    [API] Using Aramex official API with credentials...")
+        try:
+            api_url = "https://ws.aramex.net/ShippingAPI.V2/Tracking/Service_1_0.svc/json/TrackShipments"
+            payload = {
+                "ClientInfo": {
+                    "UserName": aramex_user,
+                    "Password": aramex_pass,
+                    "Version": "v1.0",
+                    "AccountNumber": aramex_num,
+                    "AccountPin": aramex_pin,
+                    "AccountEntity": aramex_entity,
+                    "AccountCountryCode": aramex_country,
+                    "Source": 24,
+                },
+                "Shipments": [tracking_number],
+                "GetLastTrackingUpdateOnly": True,
+            }
+            resp = requests.post(api_url, json=payload,
+                                 headers={"Content-Type": "application/json"}, timeout=15)
+            print(f"    Aramex API HTTP: {resp.status_code}")
+            print(f"    Aramex API body: {resp.text[:300]}")
+            if resp.status_code == 200 and resp.text.strip():
+                data    = resp.json()
+                results = data.get("TrackingResults", [])
+                if results:
+                    updates = results[0].get("Value", [])
+                    if updates:
+                        latest = updates[-1]
+                        code   = latest.get("UpdateCode", "")
+                        desc   = latest.get("UpdateDescription", "")
+                        mapped = CODE_MAP.get(code, desc or "In transit")
+                        print(f"    API result: code={code} → '{mapped}'")
+                        return mapped
+                print(f"    API: no tracking updates in response")
+        except Exception as e:
+            print(f"    API error: {e}")
+    else:
+        print(f"    No Aramex credentials in env — trying web scrape...")
+
+    # ── Fallback: try web scrape ───────────────────────────────────────────────
     tracking_url = (
         "https://www.aramex.com/us/en/track/track-results-new"
         f"?type=EXP&ShipmentNumber={tracking_number}"
     )
-    print(f"    URL: {tracking_url}")
+    print(f"    Trying web scrape: {tracking_url}")
 
     hdrs = {
         "User-Agent": (
@@ -168,94 +322,41 @@ def check_aramex_tracking(tracking_number: str) -> str:
     }
 
     try:
-        print(f"    Sending GET request to Aramex...")
         resp = requests.get(tracking_url, headers=hdrs, timeout=20)
         print(f"    Aramex HTTP: {resp.status_code} | Size: {len(resp.text):,} bytes")
+        if resp.status_code == 403:
+            print(f"    403 blocked — credentials needed for reliable tracking")
+            return "Tracking error"
         resp.raise_for_status()
 
         html  = resp.text
         soup  = BeautifulSoup(html, "html.parser")
         lower = html.lower()
 
-        # Method 1 — Next.js __NEXT_DATA__ JSON
-        print(f"    [Method 1] Looking for __NEXT_DATA__ JSON...")
         tag = soup.find("script", id="__NEXT_DATA__")
         if tag and tag.string:
-            print(f"    __NEXT_DATA__ found ({len(tag.string):,} chars) — parsing...")
             try:
                 data   = _json.loads(tag.string)
                 as_str = _json.dumps(data).lower()
                 found  = None
                 for stage in STAGES:
                     if stage.lower() in as_str:
-                        print(f"    Found stage in JSON: '{stage}'")
                         found = stage
                 if found:
-                    print(f"    [Method 1] SUCCESS → '{found}'")
+                    print(f"    Web scrape SUCCESS → '{found}'")
                     return found
-                print(f"    [Method 1] No stage labels in JSON")
-            except Exception as je:
-                print(f"    [Method 1] JSON parse error: {je}")
-        else:
-            print(f"    [Method 1] __NEXT_DATA__ not present")
+            except Exception:
+                pass
 
-        # Method 2 — CSS active/current class
-        print(f"    [Method 2] Scanning CSS active/current classes...")
-        for cls_kw in ["active", "current", "selected", "highlighted"]:
-            els = soup.find_all(
-                class_=lambda c, k=cls_kw: c and k in " ".join(c).lower()
-            )
-            if els:
-                print(f"    Found {len(els)} elements with '{cls_kw}'")
-            for el in els:
-                text = el.get_text(separator=" ", strip=True).lower()
-                for stage in reversed(STAGES):
-                    if stage.lower() in text:
-                        print(f"    [Method 2] SUCCESS → '{stage}'")
-                        return stage
-        print(f"    [Method 2] No active stage found")
-
-        # Method 3 — Exception keywords
-        print(f"    [Method 3] Scanning exception keywords...")
-        for kw, status in EXCEPTIONS.items():
-            if kw in lower:
-                print(f"    [Method 3] SUCCESS → '{status}'")
-                return status
-        print(f"    [Method 3] No exception keywords found")
-
-        # Method 4 — Full text stage scan
-        print(f"    [Method 4] Full text scan for stage labels...")
-        found = None
-        for stage in STAGES:
+        for stage in reversed(STAGES):
             if stage.lower() in lower:
-                print(f"    Found: '{stage}'")
-                found = stage
-        if found:
-            print(f"    [Method 4] SUCCESS → '{found}'")
-            return found
-        print(f"    [Method 4] No stage labels found")
+                print(f"    Text scan SUCCESS → '{stage}'")
+                return stage
 
-        # Method 5 — Latest Update section text
-        print(f"    [Method 5] Looking for Latest Update text...")
-        for t in soup.find_all(string=lambda s: s and "latest update" in s.lower()):
-            parent = t.find_parent()
-            if parent:
-                sibling = parent.find_next_sibling()
-                if sibling:
-                    txt = sibling.get_text(strip=True)
-                    if txt:
-                        print(f"    [Method 5] SUCCESS → '{txt[:60]}'")
-                        return txt[:80]
-        print(f"    [Method 5] Nothing found")
-
-        print(f"    All 5 methods exhausted — defaulting to In transit")
         return "In transit"
 
-    except requests.exceptions.Timeout:
-        print(f"    ERROR: Timed out after 20s")
-        return "Tracking error"
     except Exception as e:
-        print(f"    ERROR: {e}")
+        print(f"    Scrape error: {e}")
         return "Tracking error"
 
 
@@ -267,85 +368,103 @@ def check_professional_courier_tracking(tracking_number: str) -> str:
     """
     print(f"    Checking Professional Courier: {tracking_number}")
 
-    # Method 1 — TPC India official API
-    try:
-        print(f"    [Method 1] TPC India JSON API...")
-        url  = "https://www.tpcindia.com/api/tracking"
-        hdrs = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Referer": "https://www.tpcindia.com/",
-        }
-        resp = requests.post(url, json={"docketno": tracking_number},
-                             headers=hdrs, timeout=15)
-        print(f"    TPC API HTTP: {resp.status_code}")
-        print(f"    TPC response: {resp.text[:300]}")
-        if resp.status_code == 200 and resp.text.strip():
-            data   = resp.json()
-            status = (data.get("status") or data.get("Status") or
-                      data.get("current_status") or "")
-            if status:
-                print(f"    [Method 1] SUCCESS → '{status}'")
-                return map_professional_courier_status(str(status))
-    except Exception as e:
-        print(f"    [Method 1] Error: {e}")
+    # ── Try 17track first (supports Professional Courier) ───────────────────
+    result_17 = check_17track(tracking_number, carrier_code=2151)  # 2151 = Professional Courier
+    if result_17:
+        print(f"    17track result: '{result_17}'")
+        return map_professional_courier_status(result_17)
 
-    # Method 2 — TPC India website scrape
+    hdrs_browser = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Method 1 — TPC India TrackConsignment page (correct URL)
     try:
-        print(f"    [Method 2] TPC India website scrape...")
-        url  = f"https://www.tpcindia.com/track-shipment/?docketno={tracking_number}"
-        hdrs = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml",
-        }
-        resp = requests.get(url, headers=hdrs, timeout=15)
-        print(f"    TPC website HTTP: {resp.status_code}")
+        print(f"    [Method 1] TPC India TrackConsignment page...")
+        url  = f"https://www.tpcindia.com/TrackConsignment/Default.aspx?docket={tracking_number}"
+        resp = requests.get(url, headers=hdrs_browser, timeout=15)
+        print(f"    TPC HTTP: {resp.status_code} | Size: {len(resp.text)} bytes")
         if resp.status_code == 200:
             soup       = BeautifulSoup(resp.text, "html.parser")
             page_lower = resp.text.lower()
+            print(f"    TPC page snippet: {resp.text[500:800]}")
             if "delivered" in page_lower:
-                print(f"    [Method 2] SUCCESS → 'Delivered'")
+                print(f"    [Method 1] SUCCESS → 'Delivered'")
+                return "Delivered"
+            if "out for delivery" in page_lower:
+                return "Out for delivery"
+            if "in transit" in page_lower or "intransit" in page_lower:
+                return "In transit"
+            if "picked" in page_lower or "booked" in page_lower:
+                return "Collected"
+            # Find any table row with status text
+            for td in soup.find_all("td"):
+                txt = td.get_text(strip=True)
+                if txt and len(txt) > 3 and len(txt) < 100:
+                    mapped = map_professional_courier_status(txt)
+                    if mapped != txt[:50]:
+                        print(f"    [Method 1] Found in table: '{txt}' → '{mapped}'")
+                        return mapped
+    except Exception as e:
+        print(f"    [Method 1] Error: {e}")
+
+    # Method 2 — TPC India POST form tracking
+    try:
+        print(f"    [Method 2] TPC India POST form...")
+        url  = "https://www.tpcindia.com/TrackConsignment/Default.aspx"
+        hdrs_form = {**hdrs_browser, "Content-Type": "application/x-www-form-urlencoded"}
+        resp = requests.post(url,
+                             data={"txtdocket": tracking_number, "btntrack": "Track"},
+                             headers=hdrs_form, timeout=15)
+        print(f"    TPC POST HTTP: {resp.status_code} | Size: {len(resp.text)} bytes")
+        if resp.status_code == 200:
+            page_lower = resp.text.lower()
+            print(f"    TPC POST snippet: {resp.text[500:800]}")
+            if "delivered" in page_lower:
                 return "Delivered"
             if "out for delivery" in page_lower:
                 return "Out for delivery"
             if "in transit" in page_lower:
                 return "In transit"
-            if "picked up" in page_lower or "collected" in page_lower:
-                return "Collected"
-            for cls in ["status", "tracking-status", "shipment-status", "current-status"]:
-                el = soup.find(class_=cls)
-                if el:
-                    txt = el.get_text(strip=True)
-                    if txt:
-                        print(f"    [Method 2] Found: '{txt}'")
-                        return map_professional_courier_status(txt)
     except Exception as e:
         print(f"    [Method 2] Error: {e}")
 
-    # Method 3 — trackcourier.io aggregator
+    # Method 3 — AfterShip tracking (aggregator that supports Professional Courier)
     try:
-        print(f"    [Method 3] trackcourier.io API...")
-        url  = f"https://trackcourier.io/api/track/professional-courier/{tracking_number}"
-        hdrs = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-        }
-        resp = requests.get(url, headers=hdrs, timeout=15)
-        print(f"    trackcourier HTTP: {resp.status_code}")
-        print(f"    trackcourier body: {resp.text[:300]}")
-        if resp.status_code == 200 and resp.text.strip():
-            data   = resp.json()
-            status = (data.get("status") or data.get("Status") or
-                      data.get("delivery_status") or "")
-            if status:
-                print(f"    [Method 3] SUCCESS → '{status}'")
-                return map_professional_courier_status(str(status))
+        print(f"    [Method 3] AfterShip tracking page scrape...")
+        url  = f"https://track.aftership.com/professional-courier/{tracking_number}"
+        resp = requests.get(url, headers=hdrs_browser, timeout=15)
+        print(f"    AfterShip HTTP: {resp.status_code} | Size: {len(resp.text)} bytes")
+        if resp.status_code == 200:
+            page_lower = resp.text.lower()
+            if "delivered" in page_lower:
+                return "Delivered"
+            if "out for delivery" in page_lower:
+                return "Out for delivery"
+            if "in transit" in page_lower:
+                return "In transit"
+            # Try Next.js data
+            soup = BeautifulSoup(resp.text, "html.parser")
+            tag  = soup.find("script", id="__NEXT_DATA__")
+            if tag and tag.string:
+                try:
+                    data   = _json.loads(tag.string)
+                    as_str = _json.dumps(data).lower()
+                    for stage in reversed(STAGES):
+                        if stage.lower() in as_str:
+                            print(f"    [Method 3] SUCCESS → '{stage}'")
+                            return stage
+                except:
+                    pass
     except Exception as e:
         print(f"    [Method 3] Error: {e}")
 
-    print(f"    All methods failed — defaulting to In transit")
-    return "In transit"
+    # ── All methods failed — return direct TPC tracking URL ─────────────────
+    tracking_link = f"https://www.tpcindia.com/Track/TrackConsignment.aspx?docket_no={tracking_number}"
+    print(f"    Returning direct TPC URL: {tracking_link}")
+    return tracking_link
 
 
 def map_professional_courier_status(raw: str) -> str:
@@ -413,20 +532,7 @@ def run_tracking_check():
             results["skipped"] += 1
             continue
 
-        print(f"  Reading current delivery_status metafield...")
-        current_mf     = get_order_metafield(order_id, "custom", "delivery_status")
-        current_status = current_mf["value"] if current_mf else ""
-
-        if current_status:
-            print(f"  Stored status: '{current_status}'")
-        else:
-            print(f"  No status stored yet — first time")
-
-        if current_status in TERMINAL_STATES:
-            print(f"  Terminal state '{current_status}' — skipping permanently")
-            results["skipped"] += 1
-            continue
-
+        # ── FETCH-ONLY MODE (metafield write disabled) ──────────────────────────
         last_fulfillment = fulfillments[-1]
         tracking_number  = last_fulfillment.get("tracking_number")
         tracking_company = (last_fulfillment.get("tracking_company") or "").lower()
@@ -441,53 +547,41 @@ def run_tracking_check():
 
         results["checked"] += 1
 
-        # Detect carrier: stored name first, then auto-detect by number format
+        # Detect carrier
         if "aramex" in tracking_company:
             carrier = "aramex"
         elif "professional" in tracking_company or "tpc" in tracking_company:
             carrier = "professional_courier"
         else:
             carrier = detect_carrier(tracking_number)
-        print(f"  Carrier resolved: {carrier}")
+        print(f"  Carrier: {carrier}")
 
         if carrier == "aramex":
-            print(f"  Calling Aramex tracker...")
             new_status = check_aramex_tracking(tracking_number)
         elif carrier == "professional_courier":
-            print(f"  Calling Professional Courier tracker...")
             new_status = check_professional_courier_tracking(tracking_number)
         else:
-            new_status = f"Manual check needed ({tracking_company or 'unknown carrier'})"
-            print(f"  Unknown carrier — status: '{new_status}'")
+            new_status = f"Manual ({tracking_company or 'unknown'})"
 
-        print(f"  Tracking result: '{new_status}'")
-
-        if new_status == current_status:
-            print(f"  No change — Shopify NOT updated")
-        else:
-            print(f"  Status changed: '{current_status}' → '{new_status}'")
-            print(f"  Updating Shopify metafield...")
-            # try:
-            #     set_order_metafield(order_id, "custom", "delivery_status", new_status)
-            #     print(f"  Shopify updated ✓")
-            #     logger.info(f"{order_name}: '{current_status}' → '{new_status}'")
-            #     results["updated"] += 1
-            # except Exception as e:
-            #     err = f"{order_name}: update failed — {e}"
-            #     print(f"  ERROR: {err}")
-            #     logger.error(err)
-            #     results["errors"].append(err)
+        print(f"  ✓ STATUS: '{new_status}'")
+        results["statuses"] = results.get("statuses", [])
+        results["statuses"].append({
+            "order": order_name,
+            "tracking": tracking_number,
+            "carrier": carrier,
+            "status": new_status,
+        })
 
     print("\n" + "=" * 60)
-    print("TRACKING CHECK COMPLETE")
+    print("TRACKING FETCH COMPLETE — no writes, fetch only")
     print(f"  Orders found : {len(orders)}")
     print(f"  Checked      : {results['checked']}")
-    print(f"  Updated      : {results['updated']}")
     print(f"  Skipped      : {results['skipped']}")
     print(f"  Errors       : {len(results['errors'])}")
-    if results["errors"]:
-        for err in results["errors"]:
-            print(f"    ✗ {err}")
+    print()
+    print("── STATUSES FETCHED ──")
+    for item in results.get("statuses", []):
+        print(f"  {item['order']:8} | {item['carrier']:20} | {item['tracking']:15} | {item['status']}")
     print("=" * 60 + "\n")
     return results
 
@@ -512,15 +606,21 @@ def check_tracking():
         print(">>> Secret verified ✓")
     else:
         print(">>> No secret set — accepting all requests")
-    results = run_tracking_check()
-    return jsonify({"ok": True, "results": results})
+    import threading
+    thread = threading.Thread(target=run_tracking_check)
+    thread.daemon = True
+    thread.start()
+    return jsonify({"ok": True, "message": "Tracking check started in background."})
 
 
 @app.route("/check-tracking/manual", methods=["GET"])
 def manual_check():
     print("\n>>> GET /check-tracking/manual — manual browser trigger")
-    results = run_tracking_check()
-    return jsonify({"ok": True, "results": results})
+    import threading
+    thread = threading.Thread(target=run_tracking_check)
+    thread.daemon = True
+    thread.start()
+    return jsonify({"ok": True, "message": "Tracking check started in background."})
 
 
 @app.route("/test-aramex/<tracking_number>", methods=["GET"])
