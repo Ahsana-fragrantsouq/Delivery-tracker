@@ -482,14 +482,21 @@ def check_professional_courier_tracking(tracking_number: str) -> str:
                         payload[candidate] = tracking_number
                     print(f"    AWB field not found — using common names")
 
-                action = form.get("action") or PROF_COURIER_UAE_URL
-                method = (form.get("method") or "post").lower()
+                # Fix relative URL → absolute URL
+            raw_action = form.get("action") or PROF_COURIER_UAE_URL
+            if raw_action.startswith("http"):
+                action = raw_action
+            elif raw_action.startswith("/"):
+                action = "https://professionalcourier.ae" + raw_action
             else:
-                # No form found — try POST directly
                 action = PROF_COURIER_UAE_URL
-                method = "post"
-                payload = {"awb": tracking_number, "tracking_number": tracking_number}
-                print(f"    No form found — posting directly")
+            method = (form.get("method") or "post").lower()
+        else:
+            # No form found — try POST directly
+            action = PROF_COURIER_UAE_URL
+            method = "post"
+            payload = {"awb": tracking_number, "tracking_number": tracking_number}
+            print(f"    No form found — posting directly")
 
             print(f"    Submitting to: {action} via {method.upper()}")
             print(f"    Payload keys: {list(payload.keys())}")
@@ -533,9 +540,54 @@ def check_professional_courier_tracking(tracking_number: str) -> str:
     except Exception as e:
         print(f"    [Method 2] Error: {e}")
 
+    # ── Method 3: Try common AJAX/API endpoints ──────────────────────────────
+    try:
+        print(f"    [Method 3] Trying AJAX/API endpoints...")
+        api_candidates = [
+            ("POST", "https://professionalcourier.ae/tracking/track",
+             {"trackno": tracking_number}),
+            ("POST", "https://professionalcourier.ae/wp-admin/admin-ajax.php",
+             {"action": "track_shipment", "tracking_number": tracking_number}),
+            ("POST", "https://professionalcourier.ae/tracking/",
+             {"trackno": tracking_number, "submit": "Track"}),
+            ("GET",  f"https://professionalcourier.ae/tracking/api/{tracking_number}",
+             {}),
+            ("GET",  f"https://professionalcourier.ae/api/track/{tracking_number}",
+             {}),
+        ]
+        for method, url, data in api_candidates:
+            print(f"    Trying {method} {url}")
+            hdrs = {**PROF_COURIER_HDRS, "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json, text/plain, */*"}
+            if method == "POST":
+                r = session.post(url, data=data, headers=hdrs, timeout=10)
+            else:
+                r = session.get(url, headers=hdrs, timeout=10)
+            print(f"    HTTP {r.status_code} | Size: {len(r.text)} | Type: {r.headers.get('Content-Type','')[:40]}")
+            print(f"    Body snippet: {r.text[:200]}")
+            if r.status_code == 200 and r.text.strip():
+                # Try JSON
+                try:
+                    j = r.json()
+                    print(f"    JSON keys: {list(j.keys()) if isinstance(j, dict) else type(j)}")
+                    for k in ["status","Status","delivery_status","current_status","state"]:
+                        if isinstance(j, dict) and k in j:
+                            s = map_professional_courier_status(str(j[k]))
+                            print(f"    [Method 3] JSON SUCCESS → '{s}'")
+                            return s
+                except Exception:
+                    pass
+                # Try HTML parse
+                result = _parse_professional_courier_result(r.text, tracking_number)
+                if result:
+                    print(f"    [Method 3] HTML parse SUCCESS → '{result}'")
+                    return result
+    except Exception as e:
+        print(f"    [Method 3] Error: {e}")
+
     # ── Fallback: return the tracking URL so staff can check manually ──────
     tracking_link = f"https://professionalcourier.ae/tracking/?awb={tracking_number}"
-    print(f"    All methods failed — returning tracking link")
+    print(f"    All methods failed — returning tracking link: {tracking_link}")
     return tracking_link
 
 
