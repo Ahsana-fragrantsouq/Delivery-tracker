@@ -400,38 +400,48 @@ def _parse_professional_courier_result(html: str, awb: str) -> str:
         "shipment summary", "history", "from", "to",
     }
 
-    # ── Strategy 1: Find "Current Status" cell, get the cell BELOW it ────────
-    # The layout is a 2-column table: header row has "Current Status" | "Current Activity"
-    # Data row below has: "Delivered" | "Delivered On: ..."
-    for tag in soup.find_all(string=lambda t: t and "current status" in t.lower()):
-        parent_td = tag.find_parent(["td", "th"])
-        if parent_td:
-            # Find the parent row, then get the NEXT row
-            parent_row = parent_td.find_parent("tr")
-            if parent_row:
-                next_row = parent_row.find_next_sibling("tr")
-                if next_row:
-                    first_td = next_row.find("td")
-                    if first_td:
-                        candidate = first_td.get_text(strip=True)
-                        print(f"    Found status below 'Current Status' header: '{candidate}'")
-                        if candidate and candidate.lower() not in EXCLUDE_WORDS:
-                            raw_status = candidate
-                            break
+    # ── Strategy 1: Find any row containing "Current Status", read same column ──
+    # Page layout (4 columns in one row):
+    #   From | To | Current Status | Current Activity
+    #   Dubai| Dubai | Delivered  | Delivered On: ...
+    # "Current Status" text may be wrapped in <strong> or other child tags.
+    # We find which <td>/<th> contains "Current Status", note its column index,
+    # then read the same column index from the next <tr>.
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["td", "th"])
+        col_index = None
+        for i, cell in enumerate(cells):
+            if "current status" in cell.get_text(strip=True).lower():
+                col_index = i
+                break
+        if col_index is not None:
+            print(f"    'Current Status' found at column {col_index} in row")
+            next_row = row.find_next_sibling("tr")
+            if next_row:
+                data_cells = next_row.find_all(["td", "th"])
+                print(f"    Next row has {len(data_cells)} cells")
+                if col_index < len(data_cells):
+                    candidate = data_cells[col_index].get_text(strip=True)
+                    print(f"    Status candidate: '{candidate}'")
+                    if candidate and candidate.lower() not in EXCLUDE_WORDS:
+                        raw_status = candidate
+                        break
 
-    # ── Strategy 2: Look for a cell that contains only a known status word ────
+    # ── Strategy 2: Look for td that contains ONLY a known status word ─────────
+    # Important: only match standalone text, not partial matches.
+    # Limit to <td> only (not div/span which could be nav elements).
     KNOWN_STATUSES = {
         "delivered", "in transit", "out for delivery", "pending",
         "returned", "cancelled", "picked up", "collected",
         "departed", "at destination", "delivery attempted",
-        "on hold", "shipment on hold", "shipment out for delivery",
+        "on hold", "shipment on hold",
     }
     if not raw_status:
-        for tag in soup.find_all(["td", "div", "p", "span"]):
+        for tag in soup.find_all("td"):   # td only — avoids nav/menu elements
             txt = tag.get_text(strip=True).lower()
             if txt in KNOWN_STATUSES:
                 raw_status = tag.get_text(strip=True)
-                print(f"    Found status in element: '{raw_status}'")
+                print(f"    Found status in <td>: '{raw_status}'")
                 break
 
     # ── Strategy 3: Latest activity from history table ────────────────────────
@@ -603,19 +613,38 @@ def check_professional_courier_tracking(tracking_number: str) -> str:
 
 
 def map_professional_courier_status(raw: str) -> str:
-    """Map Professional Courier status text to standard stage labels."""
+    """Map Professional Courier UAE status text to standard stage labels."""
     r = raw.lower().strip()
-    if "delivered" in r:                          return "Delivered"
+    if not r:
+        return "In transit"
+    # Delivered
+    if "delivered" in r and "out" not in r:       return "Delivered"
+    # Return to Hub / No Answer = Delivery attempted
+    if "return to hub" in r:                      return "Delivery attempted"
+    if "no answer" in r:                          return "Delivery attempted"
+    if "returned" in r or "return to sender" in r: return "Returned to sender"
+    # Out for delivery
     if "out for delivery" in r:                   return "Out for delivery"
+    if "shipment out for delivery" in r:          return "Out for delivery"
+    # Check-in at hub = Collected/In transit
+    if "check-in" in r or "check in" in r:        return "In transit"
+    # At destination
     if "arrived" in r or "destination" in r:      return "Arrived at destination"
+    # In transit
     if "transit" in r:                            return "In transit"
+    # Departed
     if "departed" in r or "dispatched" in r:      return "Departed"
+    # Collected
     if "picked" in r or "collected" in r:         return "Collected"
     if "booked" in r or "created" in r:           return "Created"
+    # On hold
+    if "hold" in r or "pending" in r:             return "On hold"
+    # Cancelled
+    if "cancel" in r:                             return "Cancelled"
+    # Attempt
     if "attempt" in r:                            return "Delivery attempted"
-    if "hold" in r:                               return "On hold"
-    if "return" in r:                             return "Returned to sender"
-    return raw[:50] if raw else "In transit"
+    # Return raw status (truncated) if nothing matched
+    return raw[:50]
 
 
 # ─── Carrier detection ────────────────────────────────────────────────────────
