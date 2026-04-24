@@ -463,7 +463,7 @@ def _parse_professional_courier_result(html: str, awb: str) -> str:
     # ── Strategy 4: Keyword scan of full page ─────────────────────────────────
     if not raw_status:
         # Check page size — if same as empty page (~35091), no data was returned
-        if len(html) < 36000:
+        if len(html) < 37000:
             print(f"    Page size {len(html)} ≈ empty page — no tracking data")
             return ""
         if "delivered" in page_lower:
@@ -522,9 +522,10 @@ def check_professional_courier_tracking(tracking_number: str) -> str:
         resp = session.post(submit_url, data=payload, headers=submit_hdrs, timeout=20)
         print(f"    POST HTTP: {resp.status_code} | Size: {len(resp.text):,} bytes")
 
-        if resp.status_code == 200 and len(resp.text) > 36000:
+        if resp.status_code == 200 and len(resp.text) > 37000:
             # Page is larger than the empty template — tracking data returned
-            print(f"    Page has data — parsing...")
+            # Empty page ≈ 35,091 bytes | Page with data ≈ 38,000+ bytes
+            print(f"    Page has data ({len(resp.text):,} bytes) — parsing...")
             result = _parse_professional_courier_result(resp.text, tracking_number)
             if result:
                 print(f"    [Method 1] SUCCESS → '{result}'")
@@ -696,7 +697,20 @@ def run_tracking_check():
             results["skipped"] += 1
             continue
 
-        # ── FETCH-ONLY MODE (metafield write disabled) ──────────────────────────
+        # Read current stored status — skip terminal states, avoid unnecessary writes
+        print(f"  Reading delivery_status metafield...")
+        current_mf     = get_order_metafield(order_id, "custom", "delivery_status")
+        current_status = current_mf["value"] if current_mf else ""
+        if current_status:
+            print(f"  Current status: '{current_status}'")
+        else:
+            print(f"  No status stored yet (first time)")
+
+        if current_status in TERMINAL_STATES:
+            print(f"  Terminal state — skipping permanently")
+            results["skipped"] += 1
+            continue
+
         last_fulfillment = fulfillments[-1]
         tracking_number  = last_fulfillment.get("tracking_number")
         tracking_company = (last_fulfillment.get("tracking_company") or "").lower()
@@ -727,25 +741,35 @@ def run_tracking_check():
         else:
             new_status = f"Manual ({tracking_company or 'unknown'})"
 
-        print(f"  ✓ STATUS: '{new_status}'")
-        results["statuses"] = results.get("statuses", [])
-        results["statuses"].append({
-            "order": order_name,
-            "tracking": tracking_number,
-            "carrier": carrier,
-            "status": new_status,
-        })
+        print(f"  Tracking result: '{new_status}'")
 
+        if new_status == current_status:
+            print(f"  No change ('{current_status}') — skipping")
+        else:
+            print(f"  Status changed: '{current_status}' → '{new_status}'")
+            print(f"  Updating Shopify metafield...")
+            try:
+                set_order_metafield(order_id, "custom", "delivery_status", new_status)
+                print(f"  Shopify updated ✓")
+                logger.info(f"{order_name}: '{current_status}' → '{new_status}'")
+                results["updated"] += 1
+            except Exception as e:
+                err = f"{order_name}: update failed — {e}"
+                print(f"  ERROR: {err}")
+                logger.error(err)
+                results["errors"].append(err)
+
+    _tracking_running = False
     print("\n" + "=" * 60)
-    print("TRACKING FETCH COMPLETE — no writes, fetch only")
+    print("TRACKING CHECK COMPLETE")
     print(f"  Orders found : {len(orders)}")
     print(f"  Checked      : {results['checked']}")
+    print(f"  Updated      : {results['updated']}")
     print(f"  Skipped      : {results['skipped']}")
     print(f"  Errors       : {len(results['errors'])}")
-    print()
-    print("── STATUSES FETCHED ──")
-    for item in results.get("statuses", []):
-        print(f"  {item['order']:8} | {item['carrier']:20} | {item['tracking']:15} | {item['status']}")
+    if results["errors"]:
+        for err in results["errors"]:
+            print(f"    ✗ {err}")
     print("=" * 60 + "\n")
     return results
 
@@ -770,21 +794,15 @@ def check_tracking():
         print(">>> Secret verified ✓")
     else:
         print(">>> No secret set — accepting all requests")
-    import threading
-    thread = threading.Thread(target=run_tracking_check)
-    thread.daemon = True
-    thread.start()
-    return jsonify({"ok": True, "message": "Tracking check started in background."})
+    results = run_tracking_check()
+    return jsonify({"ok": True, "results": results})
 
 
 @app.route("/check-tracking/manual", methods=["GET"])
 def manual_check():
     print("\n>>> GET /check-tracking/manual — manual browser trigger")
-    import threading
-    thread = threading.Thread(target=run_tracking_check)
-    thread.daemon = True
-    thread.start()
-    return jsonify({"ok": True, "message": "Tracking check started in background."})
+    results = run_tracking_check()
+    return jsonify({"ok": True, "results": results})
 
 
 @app.route("/test-aramex/<tracking_number>", methods=["GET"])
