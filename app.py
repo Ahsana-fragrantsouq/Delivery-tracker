@@ -360,110 +360,182 @@ def check_aramex_tracking(tracking_number: str) -> str:
         return "Tracking error"
 
 
-# ─── Professional Courier tracking ────────────────────────────────────────────
+# ─── Professional Courier UAE tracking ───────────────────────────────────────
+# Site: https://professionalcourier.ae/tracking/
+# Uses form-based tracking with CSRF token handling + fallback keyword scan.
+
+PROF_COURIER_UAE_URL = "https://professionalcourier.ae/tracking/"
+
+PROF_COURIER_HDRS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": PROF_COURIER_UAE_URL,
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _parse_professional_courier_result(html: str, awb: str) -> str:
+    """
+    Parse the Professional Courier UAE tracking result page.
+    Returns a standardised status string.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    page_lower = html.lower()
+
+    raw_status = None
+
+    # ── Strategy 1: look for "Current Status" label ───────────────────────
+    for tag in soup.find_all(string=lambda t: t and "current status" in t.lower()):
+        parent = tag.find_parent()
+        if parent:
+            nxt = parent.find_next_sibling()
+            if nxt:
+                raw_status = nxt.get_text(strip=True)
+                print(f"    Found 'Current Status' sibling: '{raw_status}'")
+                break
+
+    # ── Strategy 2: look for known status words in td/div/span ───────────
+    if not raw_status:
+        for tag in soup.find_all(["td", "div", "p", "span"]):
+            txt = tag.get_text(strip=True).lower()
+            if txt in ("delivered", "in transit", "out for delivery",
+                       "pending", "returned", "cancelled", "picked up",
+                       "collected", "departed", "at destination"):
+                raw_status = tag.get_text(strip=True)
+                print(f"    Found status in tag: '{raw_status}'")
+                break
+
+    # ── Strategy 3: keyword scan of full page text ────────────────────────
+    if not raw_status:
+        if "delivered" in page_lower:          raw_status = "Delivered"
+        elif "out for delivery" in page_lower: raw_status = "Out for delivery"
+        elif "in transit" in page_lower:       raw_status = "In transit"
+        elif "picked up" in page_lower:        raw_status = "Collected"
+        elif "returned" in page_lower:         raw_status = "Returned to sender"
+        elif "cancelled" in page_lower:        raw_status = "Cancelled"
+        elif "on hold" in page_lower:          raw_status = "On hold"
+        if raw_status:
+            print(f"    Found via keyword scan: '{raw_status}'")
+
+    # ── Strategy 4: pull latest history row ───────────────────────────────
+    if not raw_status:
+        table = soup.find("table")
+        if table:
+            rows = table.find_all("tr")
+            for row in rows[1:]:
+                cols = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+                if len(cols) >= 3 and cols[2].strip():
+                    raw_status = cols[2].strip()
+                    print(f"    Found in history table: '{raw_status}'")
+                    break
+
+    return map_professional_courier_status(raw_status) if raw_status else ""
+
+
 def check_professional_courier_tracking(tracking_number: str) -> str:
     """
-    Check Professional Courier (TPC India) tracking status.
-    Tries tpcindia.com official site and trackcourier.io aggregator.
+    Track a shipment on Professional Courier UAE.
+    URL: https://professionalcourier.ae/tracking/
+
+    Method 1 — HTTP form submission (handles CSRF tokens automatically)
+    Method 2 — Direct GET with AWB in URL params
+    Method 3 — Keyword fallback on homepage content
+    Fallback  — Returns tracking URL for manual check
     """
-    print(f"    Checking Professional Courier: {tracking_number}")
+    print(f"    Checking Professional Courier UAE: {tracking_number}")
+    session = requests.Session()
 
-    # ── Try 17track first (supports Professional Courier) ───────────────────
-    result_17 = check_17track(tracking_number, carrier_code=2151)  # 2151 = Professional Courier
-    if result_17:
-        print(f"    17track result: '{result_17}'")
-        return map_professional_courier_status(result_17)
-
-    hdrs_browser = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    # Method 1 — TPC India TrackConsignment page (correct URL)
+    # ── Method 1: Form submission (loads page, extracts CSRF, submits) ─────
     try:
-        print(f"    [Method 1] TPC India TrackConsignment page...")
-        url  = f"https://www.tpcindia.com/TrackConsignment/Default.aspx?docket={tracking_number}"
-        resp = requests.get(url, headers=hdrs_browser, timeout=15)
-        print(f"    TPC HTTP: {resp.status_code} | Size: {len(resp.text)} bytes")
+        print(f"    [Method 1] Loading tracking page...")
+        resp = session.get(PROF_COURIER_UAE_URL, headers=PROF_COURIER_HDRS, timeout=15)
+        print(f"    Page HTTP: {resp.status_code} | Size: {len(resp.text):,} bytes")
+
         if resp.status_code == 200:
-            soup       = BeautifulSoup(resp.text, "html.parser")
-            page_lower = resp.text.lower()
-            print(f"    TPC page snippet: {resp.text[500:800]}")
-            if "delivered" in page_lower:
-                print(f"    [Method 1] SUCCESS → 'Delivered'")
-                return "Delivered"
-            if "out for delivery" in page_lower:
-                return "Out for delivery"
-            if "in transit" in page_lower or "intransit" in page_lower:
-                return "In transit"
-            if "picked" in page_lower or "booked" in page_lower:
-                return "Collected"
-            # Find any table row with status text
-            for td in soup.find_all("td"):
-                txt = td.get_text(strip=True)
-                if txt and len(txt) > 3 and len(txt) < 100:
-                    mapped = map_professional_courier_status(txt)
-                    if mapped != txt[:50]:
-                        print(f"    [Method 1] Found in table: '{txt}' → '{mapped}'")
-                        return mapped
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Build payload from all hidden inputs (CSRF tokens etc.)
+            payload = {}
+            form = soup.find("form")
+            if form:
+                for inp in form.find_all("input"):
+                    name  = inp.get("name")
+                    value = inp.get("value", "")
+                    if name:
+                        payload[name] = value
+
+                # Find the AWB input field
+                awb_field = form.find(
+                    "input",
+                    attrs={"placeholder": lambda p: p and "tracking" in p.lower()}
+                )
+                if awb_field and awb_field.get("name"):
+                    payload[awb_field["name"]] = tracking_number
+                    print(f"    Found AWB field: name='{awb_field['name']}'")
+                else:
+                    # Try common field names
+                    for candidate in ("awb", "tracking_number", "ref", "q",
+                                      "search", "number", "consignment"):
+                        payload[candidate] = tracking_number
+                    print(f"    AWB field not found — using common names")
+
+                action = form.get("action") or PROF_COURIER_UAE_URL
+                method = (form.get("method") or "post").lower()
+            else:
+                # No form found — try POST directly
+                action = PROF_COURIER_UAE_URL
+                method = "post"
+                payload = {"awb": tracking_number, "tracking_number": tracking_number}
+                print(f"    No form found — posting directly")
+
+            print(f"    Submitting to: {action} via {method.upper()}")
+            print(f"    Payload keys: {list(payload.keys())}")
+
+            submit_hdrs = {**PROF_COURIER_HDRS, "Content-Type": "application/x-www-form-urlencoded"}
+            if method == "get":
+                resp2 = session.get(action, params=payload, headers=PROF_COURIER_HDRS, timeout=15)
+            else:
+                resp2 = session.post(action, data=payload, headers=submit_hdrs, timeout=15)
+
+            print(f"    Submit HTTP: {resp2.status_code} | Size: {len(resp2.text):,} bytes")
+            print(f"    Response snippet: {resp2.text[300:600]}")
+
+            if resp2.status_code == 200:
+                result = _parse_professional_courier_result(resp2.text, tracking_number)
+                if result:
+                    print(f"    [Method 1] SUCCESS → '{result}'")
+                    return result
+                print(f"    [Method 1] No status found in response")
+
     except Exception as e:
         print(f"    [Method 1] Error: {e}")
 
-    # Method 2 — TPC India POST form tracking
+    # ── Method 2: Direct GET with tracking number in URL ──────────────────
     try:
-        print(f"    [Method 2] TPC India POST form...")
-        url  = "https://www.tpcindia.com/TrackConsignment/Default.aspx"
-        hdrs_form = {**hdrs_browser, "Content-Type": "application/x-www-form-urlencoded"}
-        resp = requests.post(url,
-                             data={"txtdocket": tracking_number, "btntrack": "Track"},
-                             headers=hdrs_form, timeout=15)
-        print(f"    TPC POST HTTP: {resp.status_code} | Size: {len(resp.text)} bytes")
-        if resp.status_code == 200:
-            page_lower = resp.text.lower()
-            print(f"    TPC POST snippet: {resp.text[500:800]}")
-            if "delivered" in page_lower:
-                return "Delivered"
-            if "out for delivery" in page_lower:
-                return "Out for delivery"
-            if "in transit" in page_lower:
-                return "In transit"
+        print(f"    [Method 2] Direct GET with tracking number...")
+        for url_pattern in [
+            f"{PROF_COURIER_UAE_URL}?awb={tracking_number}",
+            f"{PROF_COURIER_UAE_URL}?tracking_number={tracking_number}",
+            f"https://professionalcourier.ae/track/{tracking_number}",
+            f"https://professionalcourier.ae/tracking/{tracking_number}",
+        ]:
+            print(f"    Trying: {url_pattern}")
+            resp = session.get(url_pattern, headers=PROF_COURIER_HDRS, timeout=15)
+            print(f"    HTTP: {resp.status_code} | Size: {len(resp.text):,}")
+            if resp.status_code == 200 and len(resp.text) > 2000:
+                result = _parse_professional_courier_result(resp.text, tracking_number)
+                if result:
+                    print(f"    [Method 2] SUCCESS → '{result}'")
+                    return result
     except Exception as e:
         print(f"    [Method 2] Error: {e}")
 
-    # Method 3 — AfterShip tracking (aggregator that supports Professional Courier)
-    try:
-        print(f"    [Method 3] AfterShip tracking page scrape...")
-        url  = f"https://track.aftership.com/professional-courier/{tracking_number}"
-        resp = requests.get(url, headers=hdrs_browser, timeout=15)
-        print(f"    AfterShip HTTP: {resp.status_code} | Size: {len(resp.text)} bytes")
-        if resp.status_code == 200:
-            page_lower = resp.text.lower()
-            if "delivered" in page_lower:
-                return "Delivered"
-            if "out for delivery" in page_lower:
-                return "Out for delivery"
-            if "in transit" in page_lower:
-                return "In transit"
-            # Try Next.js data
-            soup = BeautifulSoup(resp.text, "html.parser")
-            tag  = soup.find("script", id="__NEXT_DATA__")
-            if tag and tag.string:
-                try:
-                    data   = _json.loads(tag.string)
-                    as_str = _json.dumps(data).lower()
-                    for stage in reversed(STAGES):
-                        if stage.lower() in as_str:
-                            print(f"    [Method 3] SUCCESS → '{stage}'")
-                            return stage
-                except:
-                    pass
-    except Exception as e:
-        print(f"    [Method 3] Error: {e}")
-
-    # ── All methods failed — return direct TPC tracking URL ─────────────────
-    tracking_link = f"https://www.tpcindia.com/Track/TrackConsignment.aspx?docket_no={tracking_number}"
-    print(f"    Returning direct TPC URL: {tracking_link}")
+    # ── Fallback: return the tracking URL so staff can check manually ──────
+    tracking_link = f"https://professionalcourier.ae/tracking/?awb={tracking_number}"
+    print(f"    All methods failed — returning tracking link")
     return tracking_link
 
 
