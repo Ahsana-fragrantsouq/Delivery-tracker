@@ -380,73 +380,101 @@ PROF_COURIER_HDRS = {
 def _parse_professional_courier_result(html: str, awb: str) -> str:
     """
     Parse the Professional Courier UAE tracking result page.
-    Returns a standardised status string.
+
+    The result page has this table structure:
+        | Current Status | Current Activity        |
+        | Delivered      | Delivered On: 22/04/... |
+
+    And a history table:
+        | Date       | Location | Activity                  |
+        | 22/04/2026 | Dubai    | Delivered, Received By... |
     """
     soup = BeautifulSoup(html, "html.parser")
     page_lower = html.lower()
-
     raw_status = None
 
-    # ── Strategy 1: look for "Current Status" label ───────────────────────
-    for tag in soup.find_all(string=lambda t: t and "current status" in t.lower()):
-        parent = tag.find_parent()
-        if parent:
-            nxt = parent.find_next_sibling()
-            if nxt:
-                raw_status = nxt.get_text(strip=True)
-                print(f"    Found 'Current Status' sibling: '{raw_status}'")
-                break
+    EXCLUDE_WORDS = {
+        "current activity", "current status", "activity", "status",
+        "date", "time", "location", "details", "description",
+        "action", "event", "shipment status", "tracking details",
+        "shipment summary", "history", "from", "to",
+    }
 
-    # ── Strategy 2: look for known status words in td/div/span ───────────
+    # ── Strategy 1: Find "Current Status" cell, get the cell BELOW it ────────
+    # The layout is a 2-column table: header row has "Current Status" | "Current Activity"
+    # Data row below has: "Delivered" | "Delivered On: ..."
+    for tag in soup.find_all(string=lambda t: t and "current status" in t.lower()):
+        parent_td = tag.find_parent(["td", "th"])
+        if parent_td:
+            # Find the parent row, then get the NEXT row
+            parent_row = parent_td.find_parent("tr")
+            if parent_row:
+                next_row = parent_row.find_next_sibling("tr")
+                if next_row:
+                    first_td = next_row.find("td")
+                    if first_td:
+                        candidate = first_td.get_text(strip=True)
+                        print(f"    Found status below 'Current Status' header: '{candidate}'")
+                        if candidate and candidate.lower() not in EXCLUDE_WORDS:
+                            raw_status = candidate
+                            break
+
+    # ── Strategy 2: Look for a cell that contains only a known status word ────
     KNOWN_STATUSES = {
         "delivered", "in transit", "out for delivery", "pending",
         "returned", "cancelled", "picked up", "collected",
         "departed", "at destination", "delivery attempted",
-        "on hold", "shipment on hold",
+        "on hold", "shipment on hold", "shipment out for delivery",
     }
     if not raw_status:
         for tag in soup.find_all(["td", "div", "p", "span"]):
             txt = tag.get_text(strip=True).lower()
             if txt in KNOWN_STATUSES:
                 raw_status = tag.get_text(strip=True)
-                print(f"    Found status in tag: '{raw_status}'")
+                print(f"    Found status in element: '{raw_status}'")
                 break
 
-    # ── Strategy 3: keyword scan of full page text ────────────────────────
+    # ── Strategy 3: Latest activity from history table ────────────────────────
     if not raw_status:
-        if "delivered" in page_lower:          raw_status = "Delivered"
-        elif "out for delivery" in page_lower: raw_status = "Out for delivery"
-        elif "in transit" in page_lower:       raw_status = "In transit"
-        elif "picked up" in page_lower:        raw_status = "Collected"
-        elif "returned" in page_lower:         raw_status = "Returned to sender"
-        elif "cancelled" in page_lower:        raw_status = "Cancelled"
-        elif "on hold" in page_lower:          raw_status = "On hold"
-        if raw_status:
-            print(f"    Found via keyword scan: '{raw_status}'")
-
-    # ── Strategy 4: pull latest history row (skip header rows) ───────────
-    # Words that are column headers/labels, not actual statuses
-    EXCLUDE_WORDS = {
-        "current activity", "activity", "status", "date", "time",
-        "location", "details", "description", "action", "event",
-        "current status", "shipment status", "tracking details",
-    }
-    if not raw_status:
-        table = soup.find("table")
-        if table:
+        for table in soup.find_all("table"):
             rows = table.find_all("tr")
-            for row in rows[1:]:   # skip header row
+            for row in rows[1:]:
                 cols = [td.get_text(" ", strip=True) for td in row.find_all("td")]
-                if len(cols) >= 3 and cols[2].strip():
-                    candidate = cols[2].strip()
-                    if candidate.lower() not in EXCLUDE_WORDS and len(candidate) > 3:
-                        raw_status = candidate
-                        print(f"    Found in history table: '{raw_status}'")
+                # History table: Date | Location | Activity
+                if len(cols) >= 3:
+                    activity = cols[2].strip()
+                    if activity and activity.lower() not in EXCLUDE_WORDS and len(activity) > 3:
+                        print(f"    Found in history table activity: '{activity}'")
+                        raw_status = activity
                         break
+            if raw_status:
+                break
 
-    # Final check — reject if raw_status is a header word
+    # ── Strategy 4: Keyword scan of full page ─────────────────────────────────
+    if not raw_status:
+        # Check page size — if same as empty page (~35091), no data was returned
+        if len(html) < 36000:
+            print(f"    Page size {len(html)} ≈ empty page — no tracking data")
+            return ""
+        if "delivered" in page_lower:
+            raw_status = "Delivered"
+            print(f"    Keyword scan: Delivered")
+        elif "out for delivery" in page_lower or "shipment out for delivery" in page_lower:
+            raw_status = "Out for delivery"
+            print(f"    Keyword scan: Out for delivery")
+        elif "in transit" in page_lower:
+            raw_status = "In transit"
+            print(f"    Keyword scan: In transit")
+        elif "picked up" in page_lower or "check-in" in page_lower:
+            raw_status = "Collected"
+            print(f"    Keyword scan: Collected")
+        elif "returned" in page_lower:
+            raw_status = "Returned to sender"
+        elif "cancelled" in page_lower:
+            raw_status = "Cancelled"
+
     if raw_status and raw_status.lower() in EXCLUDE_WORDS:
-        print(f"    Rejected header word: '{raw_status}'")
+        print(f"    Rejected header: '{raw_status}'")
         raw_status = None
 
     return map_professional_courier_status(raw_status) if raw_status else ""
@@ -465,87 +493,40 @@ def check_professional_courier_tracking(tracking_number: str) -> str:
     print(f"    Checking Professional Courier UAE: {tracking_number}")
     session = requests.Session()
 
-    # ── Method 1: WordPress admin-ajax.php with nonce ────────────────────────
-    # The site uses Elementor + WordPress. The AJAX URL and nonce are embedded
-    # in the page JavaScript as ElementorProFrontendConfig.
-    # We: (1) load the page, (2) extract nonce, (3) POST to admin-ajax.php
-    import re as _re
+    # ── Method 1: POST form to /tracking with trackno field ──────────────────
+    # The form POSTs to https://professionalcourier.ae/tracking with field trackno.
+    # The server returns a page with the results embedded in the HTML.
+    # Result table structure:
+    #   Header row: | Current Status | Current Activity |
+    #   Data row:   | Delivered      | Delivered On: .. |
     try:
-        print(f"    [Method 1] Loading page to extract nonce...")
-        resp = session.get(PROF_COURIER_UAE_URL, headers=PROF_COURIER_HDRS, timeout=15)
-        print(f"    Page HTTP: {resp.status_code} | Size: {len(resp.text):,} bytes")
+        print(f"    [Method 1] POSTing to tracking page...")
+        submit_url = "https://professionalcourier.ae/tracking"
+        payload = {"trackno": tracking_number}
+        submit_hdrs = {
+            **PROF_COURIER_HDRS,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://professionalcourier.ae",
+            "Referer": PROF_COURIER_UAE_URL,
+        }
+        resp = session.post(submit_url, data=payload, headers=submit_hdrs, timeout=20)
+        print(f"    POST HTTP: {resp.status_code} | Size: {len(resp.text):,} bytes")
 
-        if resp.status_code == 200:
-            html = resp.text
-
-            # Extract nonce from ElementorProFrontendConfig
-            nonce = None
-            nonce_patterns = [
-                r'"nonce": "([a-f0-9]+)"',
-                r'nonce[^:]*: [^"]*"([a-f0-9]{10,})"',
-                r'wpUtilSettings[^"]*"([^"]+admin-ajax[^"]+)"',
-            ]
-            for pat in nonce_patterns:
-                m = _re.search(pat, html)
-                if m:
-                    nonce = m.group(1)
-                    print(f"    Nonce found: {nonce[:10]}...")
-                    break
-
-            if not nonce:
-                print(f"    No nonce found — trying without")
-
-            # Try multiple action names that courier tracking plugins use
-            ajax_url = "https://professionalcourier.ae/wp-admin/admin-ajax.php"
-            action_names = [
-                "track_shipment", "courier_track", "pro_courier_track",
-                "tracking_result", "get_tracking", "track_order",
-                "woo_tracking", "shipment_track", "courier_tracking",
-                "professional_courier_track", "track", "get_shipment_status",
-            ]
-
-            for action_name in action_names:
-                payload = {
-                    "action": action_name,
-                    "trackno": tracking_number,
-                    "tracking_number": tracking_number,
-                    "awb": tracking_number,
-                }
-                if nonce:
-                    payload["nonce"]  = nonce
-                    payload["_nonce"] = nonce
-                    payload["security"] = nonce
-
-                submit_hdrs = {
-                    **PROF_COURIER_HDRS,
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": PROF_COURIER_UAE_URL,
-                }
-                r = session.post(ajax_url, data=payload, headers=submit_hdrs, timeout=10)
-                body = r.text.strip()
-                print(f"    action={action_name}: HTTP {r.status_code} | body={body[:100]}")
-
-                # "0" or "-1" = wrong action. Anything else = potential hit
-                if r.status_code == 200 and body not in ("0", "-1", "", "false", "null"):
-                    print(f"    Possible hit with action='{action_name}': {body[:200]}")
-                    # Try JSON parse
-                    try:
-                        j = _json.loads(body)
-                        for k in ["status","Status","delivery_status","current_status","state","data"]:
-                            if isinstance(j, dict) and k in j:
-                                s = map_professional_courier_status(str(j[k]))
-                                print(f"    [Method 1] JSON SUCCESS action={action_name} → '{s}'")
-                                return s
-                    except Exception:
-                        pass
-                    # Try HTML parse
-                    result = _parse_professional_courier_result(body, tracking_number)
-                    if result:
-                        print(f"    [Method 1] HTML SUCCESS action={action_name} → '{result}'")
-                        return result
-
-            print(f"    [Method 1] No action name worked")
+        if resp.status_code == 200 and len(resp.text) > 36000:
+            # Page is larger than the empty template — tracking data returned
+            print(f"    Page has data — parsing...")
+            result = _parse_professional_courier_result(resp.text, tracking_number)
+            if result:
+                print(f"    [Method 1] SUCCESS → '{result}'")
+                return result
+            # Print snippet for debugging
+            idx = resp.text.lower().find("current status")
+            if idx > 0:
+                print(f"    Current Status area: {resp.text[idx:idx+300]}")
+            else:
+                print(f"    'Current Status' not found in response")
+        else:
+            print(f"    Page too small ({len(resp.text)} bytes) — no tracking data returned")
 
     except Exception as e:
         print(f"    [Method 1] Error: {e}")
