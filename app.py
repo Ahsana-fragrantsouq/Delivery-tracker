@@ -465,80 +465,87 @@ def check_professional_courier_tracking(tracking_number: str) -> str:
     print(f"    Checking Professional Courier UAE: {tracking_number}")
     session = requests.Session()
 
-    # ── Method 1: Form submission (loads page, extracts CSRF, submits) ─────
+    # ── Method 1: WordPress admin-ajax.php with nonce ────────────────────────
+    # The site uses Elementor + WordPress. The AJAX URL and nonce are embedded
+    # in the page JavaScript as ElementorProFrontendConfig.
+    # We: (1) load the page, (2) extract nonce, (3) POST to admin-ajax.php
+    import re as _re
     try:
-        print(f"    [Method 1] Loading tracking page...")
+        print(f"    [Method 1] Loading page to extract nonce...")
         resp = session.get(PROF_COURIER_UAE_URL, headers=PROF_COURIER_HDRS, timeout=15)
         print(f"    Page HTTP: {resp.status_code} | Size: {len(resp.text):,} bytes")
 
         if resp.status_code == 200:
-            soup    = BeautifulSoup(resp.text, "html.parser")
-            payload = {}
-            form    = soup.find("form")
+            html = resp.text
 
-            if form:
-                # Collect all hidden inputs (CSRF tokens etc.)
-                for inp in form.find_all("input"):
-                    name  = inp.get("name")
-                    value = inp.get("value", "")
-                    if name:
-                        payload[name] = value
+            # Extract nonce from ElementorProFrontendConfig
+            nonce = None
+            nonce_patterns = [
+                r'"nonce": "([a-f0-9]+)"',
+                r'nonce[^:]*: [^"]*"([a-f0-9]{10,})"',
+                r'wpUtilSettings[^"]*"([^"]+admin-ajax[^"]+)"',
+            ]
+            for pat in nonce_patterns:
+                m = _re.search(pat, html)
+                if m:
+                    nonce = m.group(1)
+                    print(f"    Nonce found: {nonce[:10]}...")
+                    break
 
-                # Find the AWB input field by placeholder text
-                awb_field = form.find(
-                    "input",
-                    attrs={"placeholder": lambda p: p and "tracking" in p.lower()}
-                )
-                if not awb_field:
-                    awb_field = form.find("input", {"name": "trackno"})
-                if not awb_field:
-                    awb_field = form.find("input", {"type": "text"})
+            if not nonce:
+                print(f"    No nonce found — trying without")
 
-                if awb_field and awb_field.get("name"):
-                    payload[awb_field["name"]] = tracking_number
-                    print(f"    Found AWB field: name='{awb_field['name']}'")
-                else:
-                    payload["trackno"] = tracking_number
-                    print(f"    AWB field not found — using 'trackno'")
+            # Try multiple action names that courier tracking plugins use
+            ajax_url = "https://professionalcourier.ae/wp-admin/admin-ajax.php"
+            action_names = [
+                "track_shipment", "courier_track", "pro_courier_track",
+                "tracking_result", "get_tracking", "track_order",
+                "woo_tracking", "shipment_track", "courier_tracking",
+                "professional_courier_track", "track", "get_shipment_status",
+            ]
 
-                # Fix relative URL → absolute URL
-                raw_action = form.get("action") or PROF_COURIER_UAE_URL
-                if raw_action.startswith("http"):
-                    action = raw_action
-                elif raw_action.startswith("/"):
-                    action = "https://professionalcourier.ae" + raw_action
-                else:
-                    action = PROF_COURIER_UAE_URL
-                method = (form.get("method") or "post").lower()
+            for action_name in action_names:
+                payload = {
+                    "action": action_name,
+                    "trackno": tracking_number,
+                    "tracking_number": tracking_number,
+                    "awb": tracking_number,
+                }
+                if nonce:
+                    payload["nonce"]  = nonce
+                    payload["_nonce"] = nonce
+                    payload["security"] = nonce
 
-            else:
-                # No form found — POST directly
-                action  = PROF_COURIER_UAE_URL
-                method  = "post"
-                payload = {"trackno": tracking_number}
-                print(f"    No form found — posting directly to {action}")
+                submit_hdrs = {
+                    **PROF_COURIER_HDRS,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": PROF_COURIER_UAE_URL,
+                }
+                r = session.post(ajax_url, data=payload, headers=submit_hdrs, timeout=10)
+                body = r.text.strip()
+                print(f"    action={action_name}: HTTP {r.status_code} | body={body[:100]}")
 
-            print(f"    Submitting to: {action} via {method.upper()}")
-            print(f"    Payload keys: {list(payload.keys())}")
+                # "0" or "-1" = wrong action. Anything else = potential hit
+                if r.status_code == 200 and body not in ("0", "-1", "", "false", "null"):
+                    print(f"    Possible hit with action='{action_name}': {body[:200]}")
+                    # Try JSON parse
+                    try:
+                        j = _json.loads(body)
+                        for k in ["status","Status","delivery_status","current_status","state","data"]:
+                            if isinstance(j, dict) and k in j:
+                                s = map_professional_courier_status(str(j[k]))
+                                print(f"    [Method 1] JSON SUCCESS action={action_name} → '{s}'")
+                                return s
+                    except Exception:
+                        pass
+                    # Try HTML parse
+                    result = _parse_professional_courier_result(body, tracking_number)
+                    if result:
+                        print(f"    [Method 1] HTML SUCCESS action={action_name} → '{result}'")
+                        return result
 
-            submit_hdrs = {**PROF_COURIER_HDRS,
-                           "Content-Type": "application/x-www-form-urlencoded"}
-            if method == "get":
-                resp2 = session.get(action, params=payload,
-                                    headers=PROF_COURIER_HDRS, timeout=15)
-            else:
-                resp2 = session.post(action, data=payload,
-                                     headers=submit_hdrs, timeout=15)
-
-            print(f"    Submit HTTP: {resp2.status_code} | Size: {len(resp2.text):,} bytes")
-            print(f"    Response snippet: {resp2.text[300:700]}")
-
-            if resp2.status_code == 200:
-                result = _parse_professional_courier_result(resp2.text, tracking_number)
-                if result:
-                    print(f"    [Method 1] SUCCESS → '{result}'")
-                    return result
-                print(f"    [Method 1] No usable status found in response")
+            print(f"    [Method 1] No action name worked")
 
     except Exception as e:
         print(f"    [Method 1] Error: {e}")
