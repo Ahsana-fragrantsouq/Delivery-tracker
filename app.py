@@ -786,6 +786,33 @@ def test_professional(tracking_number):
     return jsonify({"tracking_number": tracking_number, "status": result})
 
 
+@app.route("/inspect-professional", methods=["GET"])
+def inspect_professional():
+    """Inspect the Professional Courier UAE page to find the AJAX endpoint."""
+    import re as _re
+    session = requests.Session()
+    hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    resp = session.get("https://professionalcourier.ae/tracking/", headers=hdrs, timeout=15)
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
+    findings = {"page_size": len(html), "scripts": [], "form": {}}
+    form = soup.find("form")
+    if form:
+        findings["form"] = {
+            "action": form.get("action"),
+            "method": form.get("method"),
+            "inputs": [{"name": i.get("name"), "type": i.get("type")}
+                       for i in form.find_all("input") if i.get("name")]
+        }
+    for i, script in enumerate(soup.find_all("script")):
+        src = script.string or ""
+        if src and ("ajax" in src.lower() or "track" in src.lower() or "fetch" in src.lower()):
+            findings["scripts"].append({"index": i, "snippet": src[:600]})
+    print("INSPECT:", findings)
+    return jsonify(findings)
+
+
+
 @app.route("/auth")
 def auth():
     shop     = request.args.get("shop")
