@@ -780,11 +780,8 @@ def check_tracking():
 @app.route("/check-tracking/manual", methods=["GET"])
 def manual_check():
     print("\n>>> GET /check-tracking/manual — manual browser trigger")
-    import threading
-    thread = threading.Thread(target=run_tracking_check)
-    thread.daemon = True
-    thread.start()
-    return jsonify({"ok": True, "message": "Tracking check started in background."})
+    results = run_tracking_check()
+    return jsonify({"ok": True, "results": results})
 
 
 @app.route("/test-aramex/<tracking_number>", methods=["GET"])
