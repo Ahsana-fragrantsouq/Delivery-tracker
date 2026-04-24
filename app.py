@@ -398,12 +398,16 @@ def _parse_professional_courier_result(html: str, awb: str) -> str:
                 break
 
     # ── Strategy 2: look for known status words in td/div/span ───────────
+    KNOWN_STATUSES = {
+        "delivered", "in transit", "out for delivery", "pending",
+        "returned", "cancelled", "picked up", "collected",
+        "departed", "at destination", "delivery attempted",
+        "on hold", "shipment on hold",
+    }
     if not raw_status:
         for tag in soup.find_all(["td", "div", "p", "span"]):
             txt = tag.get_text(strip=True).lower()
-            if txt in ("delivered", "in transit", "out for delivery",
-                       "pending", "returned", "cancelled", "picked up",
-                       "collected", "departed", "at destination"):
+            if txt in KNOWN_STATUSES:
                 raw_status = tag.get_text(strip=True)
                 print(f"    Found status in tag: '{raw_status}'")
                 break
@@ -420,17 +424,30 @@ def _parse_professional_courier_result(html: str, awb: str) -> str:
         if raw_status:
             print(f"    Found via keyword scan: '{raw_status}'")
 
-    # ── Strategy 4: pull latest history row ───────────────────────────────
+    # ── Strategy 4: pull latest history row (skip header rows) ───────────
+    # Words that are column headers/labels, not actual statuses
+    EXCLUDE_WORDS = {
+        "current activity", "activity", "status", "date", "time",
+        "location", "details", "description", "action", "event",
+        "current status", "shipment status", "tracking details",
+    }
     if not raw_status:
         table = soup.find("table")
         if table:
             rows = table.find_all("tr")
-            for row in rows[1:]:
+            for row in rows[1:]:   # skip header row
                 cols = [td.get_text(" ", strip=True) for td in row.find_all("td")]
                 if len(cols) >= 3 and cols[2].strip():
-                    raw_status = cols[2].strip()
-                    print(f"    Found in history table: '{raw_status}'")
-                    break
+                    candidate = cols[2].strip()
+                    if candidate.lower() not in EXCLUDE_WORDS and len(candidate) > 3:
+                        raw_status = candidate
+                        print(f"    Found in history table: '{raw_status}'")
+                        break
+
+    # Final check — reject if raw_status is a header word
+    if raw_status and raw_status.lower() in EXCLUDE_WORDS:
+        print(f"    Rejected header word: '{raw_status}'")
+        raw_status = None
 
     return map_professional_courier_status(raw_status) if raw_status else ""
 
@@ -455,67 +472,73 @@ def check_professional_courier_tracking(tracking_number: str) -> str:
         print(f"    Page HTTP: {resp.status_code} | Size: {len(resp.text):,} bytes")
 
         if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Build payload from all hidden inputs (CSRF tokens etc.)
+            soup    = BeautifulSoup(resp.text, "html.parser")
             payload = {}
-            form = soup.find("form")
+            form    = soup.find("form")
+
             if form:
+                # Collect all hidden inputs (CSRF tokens etc.)
                 for inp in form.find_all("input"):
                     name  = inp.get("name")
                     value = inp.get("value", "")
                     if name:
                         payload[name] = value
 
-                # Find the AWB input field
+                # Find the AWB input field by placeholder text
                 awb_field = form.find(
                     "input",
                     attrs={"placeholder": lambda p: p and "tracking" in p.lower()}
                 )
+                if not awb_field:
+                    awb_field = form.find("input", {"name": "trackno"})
+                if not awb_field:
+                    awb_field = form.find("input", {"type": "text"})
+
                 if awb_field and awb_field.get("name"):
                     payload[awb_field["name"]] = tracking_number
                     print(f"    Found AWB field: name='{awb_field['name']}'")
                 else:
-                    # Try common field names
-                    for candidate in ("awb", "tracking_number", "ref", "q",
-                                      "search", "number", "consignment"):
-                        payload[candidate] = tracking_number
-                    print(f"    AWB field not found — using common names")
+                    payload["trackno"] = tracking_number
+                    print(f"    AWB field not found — using 'trackno'")
 
                 # Fix relative URL → absolute URL
-            raw_action = form.get("action") or PROF_COURIER_UAE_URL
-            if raw_action.startswith("http"):
-                action = raw_action
-            elif raw_action.startswith("/"):
-                action = "https://professionalcourier.ae" + raw_action
+                raw_action = form.get("action") or PROF_COURIER_UAE_URL
+                if raw_action.startswith("http"):
+                    action = raw_action
+                elif raw_action.startswith("/"):
+                    action = "https://professionalcourier.ae" + raw_action
+                else:
+                    action = PROF_COURIER_UAE_URL
+                method = (form.get("method") or "post").lower()
+
             else:
-                action = PROF_COURIER_UAE_URL
-            method = (form.get("method") or "post").lower()
-        else:
-            # No form found — try POST directly
-            action = PROF_COURIER_UAE_URL
-            method = "post"
-            payload = {"awb": tracking_number, "tracking_number": tracking_number}
-            print(f"    No form found — posting directly")
+                # No form found — POST directly
+                action  = PROF_COURIER_UAE_URL
+                method  = "post"
+                payload = {"trackno": tracking_number}
+                print(f"    No form found — posting directly to {action}")
 
             print(f"    Submitting to: {action} via {method.upper()}")
             print(f"    Payload keys: {list(payload.keys())}")
 
-            submit_hdrs = {**PROF_COURIER_HDRS, "Content-Type": "application/x-www-form-urlencoded"}
+            submit_hdrs = {**PROF_COURIER_HDRS,
+                           "Content-Type": "application/x-www-form-urlencoded"}
             if method == "get":
-                resp2 = session.get(action, params=payload, headers=PROF_COURIER_HDRS, timeout=15)
+                resp2 = session.get(action, params=payload,
+                                    headers=PROF_COURIER_HDRS, timeout=15)
             else:
-                resp2 = session.post(action, data=payload, headers=submit_hdrs, timeout=15)
+                resp2 = session.post(action, data=payload,
+                                     headers=submit_hdrs, timeout=15)
 
             print(f"    Submit HTTP: {resp2.status_code} | Size: {len(resp2.text):,} bytes")
-            print(f"    Response snippet: {resp2.text[300:600]}")
+            print(f"    Response snippet: {resp2.text[300:700]}")
 
             if resp2.status_code == 200:
                 result = _parse_professional_courier_result(resp2.text, tracking_number)
                 if result:
                     print(f"    [Method 1] SUCCESS → '{result}'")
                     return result
-                print(f"    [Method 1] No status found in response")
+                print(f"    [Method 1] No usable status found in response")
 
     except Exception as e:
         print(f"    [Method 1] Error: {e}")
