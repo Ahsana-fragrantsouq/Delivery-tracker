@@ -7,16 +7,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
+    format="%(asctime)s  %(levelname)-8s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-SHOPIFY_STORE        = os.getenv("SHOPIFY_STORE")         # fragrantsouq.myshopify.com
-SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")  # shpat_xxx
+SHOPIFY_STORE        = os.getenv("SHOPIFY_STORE")
+SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 API_VERSION          = os.getenv("SHOPIFY_API_VERSION", "2024-04")
 
 HEADERS = {
@@ -27,41 +29,48 @@ HEADERS = {
 def shopify(path):
     return f"https://{SHOPIFY_STORE}/admin/api/{API_VERSION}{path}"
 
+# ── Startup banner ─────────────────────────────────────────────────────────────
+print("=" * 60)
+print("  DELIVERY TRACKER — STARTING")
+print(f"  Store : {SHOPIFY_STORE}")
+print(f"  Token : {'SET ✓' if SHOPIFY_ACCESS_TOKEN else 'MISSING ✗'}")
+print("=" * 60)
 
-# ── 1. Fetch all fulfilled orders (paginated) ─────────────────────────────────
-# Returns orders where fulfillment_status = "fulfilled"
-# Fulfillments are embedded in each order — no extra API call needed
+
+# ── 1. Fetch all fulfilled orders (cursor-paginated) ──────────────────────────
 
 def get_fulfilled_orders():
+    print("\n[SHOPIFY] Fetching fulfilled orders...")
     all_orders = []
     url    = shopify("/orders.json")
-    params = {
-        "fulfillment_status": "shipped",   # Shopify: "shipped" = fulfilled
-        "status":             "any",
-        "limit":              250,
-    }
+    params = {"fulfillment_status": "shipped", "status": "any", "limit": 250}
 
+    page = 0
     while url:
+        page += 1
+        print(f"  → Page {page}: GET {url}")
         r = requests.get(url, headers=HEADERS, params=params, timeout=30)
         r.raise_for_status()
+
         orders = r.json().get("orders", [])
         all_orders.extend(orders)
-        log.info(f"Fetched {len(orders)} orders (total so far: {len(all_orders)})")
+        print(f"    Got {len(orders)} orders (running total: {len(all_orders)})")
 
-        # Cursor-based pagination via Link header
+        # Next page via Link header
         link   = r.headers.get("Link", "")
         url    = None
-        params = None          # params only go on first request
+        params = None
         if 'rel="next"' in link:
             for part in link.split(","):
                 if 'rel="next"' in part:
                     url = part.split(";")[0].strip().strip("<>")
                     break
 
+    print(f"[SHOPIFY] Total fulfilled orders fetched: {len(all_orders)}\n")
     return all_orders
 
 
-# ── 2. Mark Delivery Status = Delivered in Shopify ────────────────────────────
+# ── 2. Mark Delivery Status = Delivered ───────────────────────────────────────
 
 def mark_delivered(order_id, fulfillment_id):
     r = requests.post(
@@ -75,11 +84,12 @@ def mark_delivered(order_id, fulfillment_id):
 
 
 # ── 3. Scrape professionalcourier.ae ─────────────────────────────────────────
-# Reads ONLY the "Current Status" cell for the specific tracking number.
-# Never reads the whole page — prevents false positives.
+# Reads ONLY the "Current Status" table cell for the specific AWB.
+# Never reads whole page — prevents false positives.
 
 def check_courier(tracking_number: str) -> dict:
     TRACKING_URL = "https://professionalcourier.ae/tracking/"
+    print(f"    [COURIER] Checking AWB {tracking_number}...")
 
     session = requests.Session()
     session.headers.update({
@@ -88,17 +98,18 @@ def check_courier(tracking_number: str) -> dict:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Referer":  "https://professionalcourier.ae/",
-        "Accept":   "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Referer":        "https://professionalcourier.ae/",
+        "Accept":         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language":"en-US,en;q=0.9",
     })
 
-    # Step 1 — load the page to grab hidden CSRF tokens
+    # Step 1 — load page (grab hidden CSRF fields)
     try:
         page = session.get(TRACKING_URL, timeout=20)
         page.raise_for_status()
+        print(f"    [COURIER] Page loaded OK (status {page.status_code})")
     except Exception as e:
-        log.warning(f"[{tracking_number}] Courier site unreachable: {e}")
+        print(f"    [COURIER] ✗ Site unreachable: {e}")
         return {"is_delivered": False, "status": "unreachable", "error": str(e)}
 
     soup      = BeautifulSoup(page.text, "html.parser")
@@ -108,8 +119,11 @@ def check_courier(tracking_number: str) -> dict:
         for inp in form.find_all("input", {"type": "hidden"}):
             if inp.get("name"):
                 form_data[inp["name"]] = inp.get("value", "")
+        print(f"    [COURIER] Form found, hidden fields: {list(form_data.keys())}")
+    else:
+        print(f"    [COURIER] No form found on page")
 
-    # Try every common field name the form might use
+    # Try every common field name
     for field in ("tracknumber", "TrackNo", "track_no", "awb_no",
                   "awbno", "awb", "tracking_number", "number"):
         form_data[field] = tracking_number
@@ -118,23 +132,27 @@ def check_courier(tracking_number: str) -> dict:
     try:
         resp = session.post(TRACKING_URL, data=form_data, timeout=20)
         resp.raise_for_status()
+        print(f"    [COURIER] POST response: {resp.status_code} ({len(resp.text)} chars)")
     except Exception as e:
-        log.warning(f"[{tracking_number}] Courier POST failed: {e}")
+        print(f"    [COURIER] ✗ POST failed: {e}")
         return {"is_delivered": False, "status": "post_failed", "error": str(e)}
 
     result_soup = BeautifulSoup(resp.text, "html.parser")
     page_text   = result_soup.get_text(" ", strip=True)
 
-    # Step 3 — verify this tracking number appears in the result
+    # Step 3 — check tracking number appears in result
     if tracking_number not in page_text:
-        log.info(f"[{tracking_number}] Not found on courier site")
+        print(f"    [COURIER] ✗ Tracking number not found in result page")
         return {"is_delivered": False, "status": "not_found"}
 
-    # Step 4 — find the summary table:
-    # From | To | Current Status | Current Activity
+    print(f"    [COURIER] ✓ Tracking number found in result")
+
+    # Step 4 — find "Current Status" column in summary table
+    # Table structure: From | To | Current Status | Current Activity
     status_text = ""
     for table in result_soup.find_all("table"):
         headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+        print(f"    [COURIER] Table headers: {headers}")
         if "current status" in headers:
             try:
                 si   = headers.index("current status")
@@ -143,11 +161,12 @@ def check_courier(tracking_number: str) -> dict:
                     cells = rows[1].find_all("td")
                     if cells and si < len(cells):
                         status_text = cells[si].get_text(strip=True)
-            except (ValueError, IndexError):
-                pass
-            break  # found the right table — stop
+                        print(f"    [COURIER] Current Status cell: '{status_text}'")
+            except (ValueError, IndexError) as e:
+                print(f"    [COURIER] Table parse error: {e}")
+            break
 
-    # Step 5 — fallback: scan 400 chars after the tracking number
+    # Step 5 — fallback: scan text near tracking number
     if not status_text:
         idx = page_text.find(tracking_number)
         if idx != -1:
@@ -156,92 +175,99 @@ def check_courier(tracking_number: str) -> dict:
                       "dispatched", "picked up", "processing", "pending"]:
                 if k in nearby:
                     status_text = k.title()
+                    print(f"    [COURIER] Fallback status found: '{status_text}'")
                     break
 
-    # Step 6 — SAFE decision: exact match on status cell only
+    # Step 6 — exact match only (never partial/page-wide match)
     is_delivered = status_text.strip().lower() in (
         "delivered", "delivery complete", "successfully delivered"
     )
 
-    log.info(f"[{tracking_number}] Courier status: '{status_text}' → is_delivered={is_delivered}")
-    return {
-        "is_delivered": is_delivered,
-        "status":       status_text or "unknown",
-    }
+    print(f"    [COURIER] Final → status='{status_text}' is_delivered={is_delivered}")
+    return {"is_delivered": is_delivered, "status": status_text or "unknown"}
 
 
 # ── Main logic ────────────────────────────────────────────────────────────────
-#
-# CONDITIONS (both must be true to process a fulfillment):
-#   1. Delivery Status = "Tracking added"
-#      → fulfillment["shipment_status"] is NOT "delivered"
-#      → specifically looks for "in_transit" or None/unknown
-#   2. Tracking company = "Other"
-#      → fulfillment["tracking_company"] == "Other"
-#
-# If both conditions met → scrape professionalcourier.ae
-# If courier says Delivered → POST fulfillment event → Shopify shows "Delivered"
 
 def run_tracking():
-    summary = {"checked": 0, "updated": 0, "errors": 0, "skipped": 0, "details": []}
+    print("\n" + "=" * 60)
+    print("  RUN TRACKING STARTED")
+    print("=" * 60)
 
+    summary = {
+        "checked": 0, "updated": 0,
+        "errors":  0, "skipped": 0,
+        "details": []
+    }
+
+    # Fetch orders
     try:
         orders = get_fulfilled_orders()
     except Exception as e:
-        log.error(f"Failed to fetch orders: {e}")
+        print(f"[ERROR] Failed to fetch orders: {e}")
         summary["errors"] += 1
         return summary
 
-    log.info(f"Processing {len(orders)} fulfilled orders...")
+    print(f"[PROCESSING] {len(orders)} orders to check...\n")
 
     for order in orders:
         order_number = order.get("order_number") or order.get("name")
         order_id     = order["id"]
 
         for ful in order.get("fulfillments", []):
-            ful_id          = ful["id"]
-            tracking_number = ful.get("tracking_number") or ""
+            ful_id           = ful["id"]
+            tracking_number  = (ful.get("tracking_number") or "").strip()
             tracking_company = (ful.get("tracking_company") or "").strip()
             shipment_status  = (ful.get("shipment_status") or "").lower()
 
+            print(f"\n  Order #{order_number} | AWB: {tracking_number} | "
+                  f"Carrier: {tracking_company} | Status: {shipment_status}")
+
             detail = {
-                "order":           order_number,
-                "tracking_number": tracking_number,
-                "company":         tracking_company,
-                "shopify_status":  shipment_status,
-                "action":          None,
+                "order":    order_number,
+                "awb":      tracking_number,
+                "carrier":  tracking_company,
+                "status":   shipment_status,
+                "action":   None,
             }
 
-            # ── Condition 1: Delivery Status must be "Tracking added" ─────────
-            # shipment_status "in_transit" = "Tracking added" in Shopify admin
-            # Skip if already delivered
+            # ── Condition 1: Not already delivered ───────────────────────────
             if shipment_status == "delivered":
-                detail["action"] = "skipped (already delivered)"
+                msg = "skip — already delivered"
+                print(f"  → {msg}")
+                detail["action"] = msg
                 summary["skipped"] += 1
                 summary["details"].append(detail)
                 continue
 
-            # ── Condition 2: Carrier must be "Other" (Professional Courier) ───
+            # ── Condition 2: Carrier must be "Other" ─────────────────────────
             if tracking_company.lower() != "other":
-                detail["action"] = f"skipped (carrier: {tracking_company})"
+                msg = f"skip — carrier is '{tracking_company}' not 'Other'"
+                print(f"  → {msg}")
+                detail["action"] = msg
                 summary["skipped"] += 1
                 summary["details"].append(detail)
                 continue
 
+            # ── No tracking number ────────────────────────────────────────────
             if not tracking_number:
-                detail["action"] = "skipped (no tracking number)"
+                msg = "skip — no tracking number"
+                print(f"  → {msg}")
+                detail["action"] = msg
                 summary["skipped"] += 1
                 summary["details"].append(detail)
                 continue
 
             # ── Both conditions met → check courier ───────────────────────────
+            print(f"  → ✓ Conditions met — checking professionalcourier.ae...")
             summary["checked"] += 1
-            log.info(f"Order {order_number} | Tracking {tracking_number} → checking courier...")
 
             courier = check_courier(tracking_number)
 
             if courier.get("error"):
-                detail["action"] = f"error: {courier['error']}"
+                msg = f"error: {courier['error']}"
+                print(f"  → ✗ {msg}")
+                detail["action"] = msg
                 summary["errors"] += 1
                 summary["details"].append(detail)
                 continue
@@ -249,56 +275,60 @@ def run_tracking():
             if courier["is_delivered"]:
                 try:
                     mark_delivered(order_id, ful_id)
-                    detail["action"] = "✅ marked delivered"
+                    msg = "✅ MARKED DELIVERED in Shopify"
+                    print(f"  → {msg}")
+                    detail["action"] = msg
                     summary["updated"] += 1
-                    log.info(f"Order {order_number} | Tracking {tracking_number} → MARKED DELIVERED")
                 except Exception as e:
-                    detail["action"] = f"shopify_error: {e}"
+                    msg = f"Shopify update failed: {e}"
+                    print(f"  → ✗ {msg}")
+                    detail["action"] = msg
                     summary["errors"] += 1
-                    log.error(f"Order {order_number} | Shopify update failed: {e}")
             else:
-                detail["action"] = f"not delivered (status: {courier['status']})"
-                log.info(f"Order {order_number} | Not yet delivered: {courier['status']}")
+                msg = f"not delivered yet (courier: {courier['status']})"
+                print(f"  → {msg}")
+                detail["action"] = msg
 
             summary["details"].append(detail)
 
-    log.info(
-        f"Done. checked={summary['checked']} updated={summary['updated']} "
-        f"errors={summary['errors']} skipped={summary['skipped']}"
-    )
+    print("\n" + "=" * 60)
+    print(f"  RUN COMPLETE")
+    print(f"  Checked : {summary['checked']}")
+    print(f"  Updated : {summary['updated']}")
+    print(f"  Skipped : {summary['skipped']}")
+    print(f"  Errors  : {summary['errors']}")
+    print("=" * 60 + "\n")
+
     return summary
 
 
-# ── Flask routes ──────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────────────
 
 @app.route("/check-tracking", methods=["POST", "GET"])
 def check_tracking():
-    """
-    Called by Shopify Flow at 9am and 6pm IST every day.
-    Loops all fulfilled orders → checks courier → marks delivered if confirmed.
-    """
-    log.info("=== /check-tracking triggered ===")
+    """Called by Shopify Flow at 9am and 6pm IST."""
+    print(f"\n>>> POST /check-tracking — triggered")
     summary = run_tracking()
     return jsonify({"ok": True, "summary": summary}), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check — Render and UptimeRobot ping this to keep the server warm."""
+    """Ping this every 14 min from UptimeRobot to keep Render awake."""
+    print(">>> GET /health — OK")
     return jsonify({"status": "ok", "store": SHOPIFY_STORE}), 200
 
 
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "service": "Delivery Sync",
-        "store":   SHOPIFY_STORE,
+        "service":   "Delivery Sync — Fragrant Souq",
         "endpoints": {
-            "POST /check-tracking": "Run tracking check (called by Shopify Flow)",
-            "GET  /health":         "Health check",
+            "POST /check-tracking": "Run tracking (called by Shopify Flow)",
+            "GET  /health":         "Health check for uptime monitors",
         }
     }), 200
 
 
 if __name__ == "__main__":
-    app.run(debug=False, port=5000)
+    app.run(debug=False, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
