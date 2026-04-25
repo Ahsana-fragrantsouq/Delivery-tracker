@@ -733,6 +733,13 @@ def run_tracking_check():
             results["skipped"] += 1
             continue
 
+        # Skip Aramex orders that already have a tracking URL stored
+        # We can't get real Aramex status without credentials — no point rechecking
+        if current_status and current_status.startswith("https://www.aramex.com"):
+            print(f"  Aramex URL already stored — skipping (no credentials for real status)")
+            results["skipped"] += 1
+            continue
+
         last_fulfillment = fulfillments[-1]
         tracking_number  = last_fulfillment.get("tracking_number")
         tracking_company = (last_fulfillment.get("tracking_company") or "").lower()
