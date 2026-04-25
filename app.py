@@ -139,12 +139,20 @@ def mark_fulfillment_delivered(order_id, fulfillment_id):
 
 
 def get_order_metafield(order_id, namespace, key):
+    import time
     url  = shopify_url(f"orders/{order_id}/metafields.json")
-    resp = requests.get(url, headers=shopify_headers(),
-                        params={"namespace": namespace, "key": key})
-    resp.raise_for_status()
-    mfs = resp.json().get("metafields", [])
-    return mfs[0] if mfs else None
+    for attempt in range(3):
+        resp = requests.get(url, headers=shopify_headers(),
+                            params={"namespace": namespace, "key": key})
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", 2))
+            print(f"    Rate limited — waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        mfs = resp.json().get("metafields", [])
+        return mfs[0] if mfs else None
+    return None
 
 
 def set_order_metafield(order_id, namespace, key, value):
@@ -719,7 +727,21 @@ def run_tracking_check():
             results["skipped"] += 1
             continue
 
-        # Read current stored status — skip terminal states, avoid unnecessary writes
+        # Check tracking number FIRST — skip metafield read if no tracking
+        last_fulfillment = fulfillments[-1]
+        tracking_number  = last_fulfillment.get("tracking_number")
+        tracking_company = (last_fulfillment.get("tracking_company") or "").lower()
+
+        if not tracking_number:
+            print(f"  No tracking number — skipping")
+            results["skipped"] += 1
+            continue
+
+        print(f"  Tracking: {tracking_number} | Carrier: {tracking_company or 'unknown'}")
+
+        # Now read metafield (only for orders with tracking numbers)
+        import time
+        time.sleep(0.5)  # 0.5s delay to avoid 429 rate limit (Shopify allows 2 req/sec)
         print(f"  Reading delivery_status metafield...")
         current_mf     = get_order_metafield(order_id, "custom", "delivery_status")
         current_status = current_mf["value"] if current_mf else ""
@@ -734,21 +756,8 @@ def run_tracking_check():
             continue
 
         # Skip Aramex orders that already have a tracking URL stored
-        # We can't get real Aramex status without credentials — no point rechecking
         if current_status and current_status.startswith("https://www.aramex.com"):
-            print(f"  Aramex URL already stored — skipping (no credentials for real status)")
-            results["skipped"] += 1
-            continue
-
-        last_fulfillment = fulfillments[-1]
-        tracking_number  = last_fulfillment.get("tracking_number")
-        tracking_company = (last_fulfillment.get("tracking_company") or "").lower()
-
-        print(f"  Tracking number : {tracking_number}")
-        print(f"  Carrier (stored): {tracking_company or '(not specified)'}")
-
-        if not tracking_number:
-            print(f"  No tracking number — skipping")
+            print(f"  Aramex URL already stored — skipping")
             results["skipped"] += 1
             continue
 
