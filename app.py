@@ -116,43 +116,13 @@ def get_fulfilled_undelivered_orders():
     return orders
 
 
-def mark_fulfillment_delivered(order_id, fulfillment_id):
-    """
-    Creates a fulfillment event with status 'delivered'.
-    This updates the Fulfillment status column from 'Fulfilled' to 'Delivered'
-    in the Shopify Orders page.
-    """
-    url = shopify_url(f"orders/{order_id}/fulfillments/{fulfillment_id}/events.json")
-    payload = {
-        "event": {
-            "status": "delivered"
-        }
-    }
-    resp = requests.post(url, headers=shopify_headers(), json=payload)
-    print(f"    Fulfillment event HTTP: {resp.status_code}")
-    if resp.status_code in (200, 201):
-        print(f"    Fulfillment marked as delivered ✓")
-        return True
-    else:
-        print(f"    Fulfillment event failed: {resp.text[:200]}")
-        return False
-
-
 def get_order_metafield(order_id, namespace, key):
-    import time
     url  = shopify_url(f"orders/{order_id}/metafields.json")
-    for attempt in range(3):
-        resp = requests.get(url, headers=shopify_headers(),
-                            params={"namespace": namespace, "key": key})
-        if resp.status_code == 429:
-            wait = int(resp.headers.get("Retry-After", 2))
-            print(f"    Rate limited — waiting {wait}s...")
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        mfs = resp.json().get("metafields", [])
-        return mfs[0] if mfs else None
-    return None
+    resp = requests.get(url, headers=shopify_headers(),
+                        params={"namespace": namespace, "key": key})
+    resp.raise_for_status()
+    mfs = resp.json().get("metafields", [])
+    return mfs[0] if mfs else None
 
 
 def set_order_metafield(order_id, namespace, key, value):
@@ -694,24 +664,9 @@ def detect_carrier(tracking_number: str) -> str:
 
 
 # ─── Core logic ───────────────────────────────────────────────────────────────
-_tracking_running = False
-
 def run_tracking_check():
-    """
-    No metafields — pure fulfillment status update:
-    1. Fetch all fulfilled orders
-    2. Skip: no tracking, Aramex, already delivered in Shopify
-    3. Check Professional Courier status
-    4. If Delivered → mark Shopify fulfillment as Delivered
-    """
-    global _tracking_running
-    if _tracking_running:
-        print("Already running — skipping duplicate trigger")
-        return {"checked": 0, "updated": 0, "skipped": 0, "errors": ["Already running"]}
-    _tracking_running = True
-
     print("\n" + "=" * 60)
-    print("TRACKING CHECK STARTED (no metafield mode)")
+    print("TRACKING CHECK STARTED")
     print("=" * 60)
 
     results = {"checked": 0, "updated": 0, "skipped": 0, "errors": []}
@@ -720,80 +675,101 @@ def run_tracking_check():
         orders = get_fulfilled_undelivered_orders()
     except Exception as e:
         print(f"FATAL: Could not fetch orders — {e}")
-        _tracking_running = False
-        results["errors"].append(str(e))
+        logger.error(f"Order fetch failed: {e}")
+        results["errors"].append(f"Failed to fetch orders: {e}")
         return results
 
     if not orders:
-        print("No fulfilled orders found.")
-        _tracking_running = False
+        print("No fulfilled orders found. Nothing to do.")
         return results
 
-    print(f"\n── Processing {len(orders)} orders ──")
-
-    import time
+    print(f"\n── STEP 2: Processing {len(orders)} orders ──")
 
     for i, order in enumerate(orders, 1):
         order_id     = order["id"]
         order_name   = order.get("name", str(order_id))
         fulfillments = order.get("fulfillments", [])
 
-        print(f"\n[{i}/{len(orders)}] {order_name}")
+        print(f"\n[{i}/{len(orders)}] Order {order_name}  (id: {order_id})")
 
         if not fulfillments:
+            print(f"  No fulfillments — skipping")
             results["skipped"] += 1
             continue
 
-        last_fulfillment    = fulfillments[-1]
-        tracking_number     = last_fulfillment.get("tracking_number")
-        tracking_company    = (last_fulfillment.get("tracking_company") or "").lower()
-        fulfillment_id      = last_fulfillment.get("id")
-        shopify_ship_status = last_fulfillment.get("shipment_status")
+        # Read current stored status — skip terminal states, avoid unnecessary writes
+        print(f"  Reading delivery_status metafield...")
+        current_mf     = get_order_metafield(order_id, "custom", "delivery_status")
+        current_status = current_mf["value"] if current_mf else ""
+        if current_status:
+            print(f"  Current status: '{current_status}'")
+        else:
+            print(f"  No status stored yet (first time)")
+
+        if current_status in TERMINAL_STATES:
+            print(f"  Terminal state — skipping permanently")
+            results["skipped"] += 1
+            continue
+
+        last_fulfillment = fulfillments[-1]
+        tracking_number  = last_fulfillment.get("tracking_number")
+        tracking_company = (last_fulfillment.get("tracking_company") or "").lower()
+
+        print(f"  Tracking number : {tracking_number}")
+        print(f"  Carrier (stored): {tracking_company or '(not specified)'}")
 
         if not tracking_number:
             print(f"  No tracking number — skipping")
             results["skipped"] += 1
             continue
 
-        print(f"  Tracking: {tracking_number} | Carrier: {tracking_company or 'unknown'} | Shopify: {shopify_ship_status}")
-
-        # Already delivered in Shopify — skip
-        if shopify_ship_status == "delivered":
-            print(f"  Already delivered in Shopify — skipping")
-            results["skipped"] += 1
-            continue
-
-        # Aramex — skip (no credentials)
-        tn = str(tracking_number).strip()
-        is_aramex = ("aramex" in tracking_company or
-                     (tn.isdigit() and len(tn) == 11))
-        if is_aramex:
-            print(f"  Aramex — no credentials, skipping")
-            results["skipped"] += 1
-            continue
-
-        # Professional Courier — check status
         results["checked"] += 1
-        time.sleep(0.3)
-        new_status = check_professional_courier_tracking(tracking_number)
-        print(f"  Status: '{new_status}'")
 
-        if new_status == "Delivered" and fulfillment_id:
-            print(f"  DELIVERED — updating Shopify fulfillment...")
+        # Detect carrier
+        if "aramex" in tracking_company:
+            carrier = "aramex"
+        elif "professional" in tracking_company or "tpc" in tracking_company:
+            carrier = "professional_courier"
+        else:
+            carrier = detect_carrier(tracking_number)
+        print(f"  Carrier: {carrier}")
+
+        if carrier == "aramex":
+            new_status = check_aramex_tracking(tracking_number)
+        elif carrier == "professional_courier":
+            new_status = check_professional_courier_tracking(tracking_number)
+        else:
+            new_status = f"Manual ({tracking_company or 'unknown'})"
+
+        print(f"  Tracking result: '{new_status}'")
+
+        if new_status == current_status:
+            print(f"  No change ('{current_status}') — skipping")
+        else:
+            print(f"  Status changed: '{current_status}' → '{new_status}'")
+            print(f"  Updating Shopify metafield...")
             try:
-                success = mark_fulfillment_delivered(order_id, fulfillment_id)
-                if success:
-                    print(f"  ✓ Fulfilled → Delivered")
-                    results["updated"] += 1
+                set_order_metafield(order_id, "custom", "delivery_status", new_status)
+                print(f"  Shopify updated ✓")
+                logger.info(f"{order_name}: '{current_status}' → '{new_status}'")
+                results["updated"] += 1
             except Exception as e:
-                err = f"{order_name}: {e}"
+                err = f"{order_name}: update failed — {e}"
                 print(f"  ERROR: {err}")
+                logger.error(err)
                 results["errors"].append(err)
 
     _tracking_running = False
     print("\n" + "=" * 60)
     print("TRACKING CHECK COMPLETE")
-    print(f"  Orders : {len(orders)} | Checked: {results['checked']} | Updated: {results['updated']} | Skipped: {results['skipped']} | Errors: {len(results['errors'])}")
+    print(f"  Orders found : {len(orders)}")
+    print(f"  Checked      : {results['checked']}")
+    print(f"  Updated      : {results['updated']}")
+    print(f"  Skipped      : {results['skipped']}")
+    print(f"  Errors       : {len(results['errors'])}")
+    if results["errors"]:
+        for err in results["errors"]:
+            print(f"    ✗ {err}")
     print("=" * 60 + "\n")
     return results
 
