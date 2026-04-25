@@ -116,6 +116,28 @@ def get_fulfilled_undelivered_orders():
     return orders
 
 
+def mark_fulfillment_delivered(order_id, fulfillment_id):
+    """
+    Creates a fulfillment event with status 'delivered'.
+    This updates the Fulfillment status column from 'Fulfilled' to 'Delivered'
+    in the Shopify Orders page.
+    """
+    url = shopify_url(f"orders/{order_id}/fulfillments/{fulfillment_id}/events.json")
+    payload = {
+        "event": {
+            "status": "delivered"
+        }
+    }
+    resp = requests.post(url, headers=shopify_headers(), json=payload)
+    print(f"    Fulfillment event HTTP: {resp.status_code}")
+    if resp.status_code in (200, 201):
+        print(f"    Fulfillment marked as delivered ✓")
+        return True
+    else:
+        print(f"    Fulfillment event failed: {resp.text[:200]}")
+        return False
+
+
 def get_order_metafield(order_id, namespace, key):
     url  = shopify_url(f"orders/{order_id}/metafields.json")
     resp = requests.get(url, headers=shopify_headers(),
@@ -743,21 +765,23 @@ def run_tracking_check():
 
         print(f"  Tracking result: '{new_status}'")
 
-        if new_status == current_status:
-            print(f"  No change ('{current_status}') — skipping")
-        else:
-            print(f"  Status changed: '{current_status}' → '{new_status}'")
-            print(f"  Updating Shopify metafield...")
-            try:
-                set_order_metafield(order_id, "custom", "delivery_status", new_status)
-                print(f"  Shopify updated ✓")
-                logger.info(f"{order_name}: '{current_status}' → '{new_status}'")
-                results["updated"] += 1
-            except Exception as e:
-                err = f"{order_name}: update failed — {e}"
-                print(f"  ERROR: {err}")
-                logger.error(err)
-                results["errors"].append(err)
+        print(f"  ✓ STATUS: '{new_status}'")
+
+        # Only action: if Delivered → update Shopify Fulfillment status
+        # (metafield writes disabled — enable later when ready)
+        if new_status == "Delivered":
+            fulfillment_id = fulfillments[-1].get("id")
+            if fulfillment_id:
+                print(f"  Status is Delivered — marking fulfillment as delivered in Shopify...")
+                try:
+                    mark_fulfillment_delivered(order_id, fulfillment_id)
+                    results["updated"] += 1
+                except Exception as e:
+                    err = f"{order_name}: fulfillment update failed — {e}"
+                    print(f"  ERROR: {err}")
+                    results["errors"].append(err)
+            else:
+                print(f"  No fulfillment ID found — skipping")
 
     _tracking_running = False
     print("\n" + "=" * 60)
