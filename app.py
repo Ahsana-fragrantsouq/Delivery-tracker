@@ -38,18 +38,12 @@ print("=" * 60)
 
 
 # ── 1. Fetch only orders that need delivery check ─────────────────────────────
-# Shopify REST API has no direct filter for Delivery Status (shipment_status).
-# So we fetch fulfilled orders, then filter in Python for:
-#   - shipment_status != 'delivered'  →  Delivery Status = 'Tracking added'
-#   - tracking_company == 'Other'     →  Professional Courier
-#   - tracking_number is not empty
-
 def get_orders_needing_delivery_check():
     print("\n[SHOPIFY] Fetching orders where Delivery Status = Tracking added...")
     all_orders = []
     url    = shopify("/orders.json")
     params = {
-        "fulfillment_status": "shipped",  # only fulfilled orders
+        "fulfillment_status": "shipped",
         "status":             "any",
         "limit":              250,
     }
@@ -64,8 +58,6 @@ def get_orders_needing_delivery_check():
         orders = r.json().get("orders", [])
         print(f"    Fetched {len(orders)} orders from Shopify")
 
-        # Filter: keep only orders with at least one fulfillment that
-        # needs a delivery check (not yet delivered + carrier Other + has AWB)
         for order in orders:
             needs_check = any(
                 (ful.get("shipment_status") or "") != "delivered"
@@ -78,7 +70,6 @@ def get_orders_needing_delivery_check():
 
         print(f"    {len(all_orders)} orders need delivery check so far")
 
-        # Cursor-based pagination via Link header
         link   = r.headers.get("Link", "")
         url    = None
         params = None
@@ -106,13 +97,12 @@ def mark_delivered(order_id, fulfillment_id):
 
 
 # ── 3. Scrape professionalcourier.ae ─────────────────────────────────────────
-# Reads ONLY the "Current Status" table cell for the specific AWB.
-# Never reads whole page — prevents false positives.
+# Confirmed from browser DevTools:
+#   Form action : https://professionalcourier.ae/tracking  (POST)
+#   Field name  : trackno
+# Flow: GET first to obtain session cookie → POST with trackno=AWB
 
 def check_courier(tracking_number: str) -> dict:
-    # Confirmed from browser DevTools:
-    # Form action : https://professionalcourier.ae/tracking  (POST)
-    # Field name  : trackno
     TRACKING_URL = "https://professionalcourier.ae/tracking"
     print(f"    [COURIER] Checking AWB {tracking_number}...")
 
@@ -123,17 +113,34 @@ def check_courier(tracking_number: str) -> dict:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Referer":         "https://professionalcourier.ae/tracking",
-        "Origin":          "https://professionalcourier.ae",
         "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     })
 
-    # POST with confirmed field name "trackno"
+    # ── Step 1: GET the page to obtain session cookies ────────────────────────
     try:
-        resp = session.post(TRACKING_URL, data={"trackno": tracking_number}, timeout=20)
+        get_resp = session.get(TRACKING_URL, timeout=20)
+        get_resp.raise_for_status()
+        print(f"    [COURIER] GET OK — {len(get_resp.text)} chars | "
+              f"cookies: {list(session.cookies.keys())}")
+    except Exception as e:
+        print(f"    [COURIER] ✗ GET failed: {e}")
+        return {"is_delivered": False, "status": "unreachable", "error": str(e)}
+
+    # ── Step 2: POST with correct field name "trackno" ────────────────────────
+    try:
+        resp = session.post(
+            TRACKING_URL,
+            data={"trackno": tracking_number},
+            headers={
+                "Referer":      TRACKING_URL,
+                "Origin":       "https://professionalcourier.ae",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=20,
+        )
         resp.raise_for_status()
-        print(f"    [COURIER] POST response: {resp.status_code} ({len(resp.text)} chars)")
+        print(f"    [COURIER] POST {resp.status_code} — {len(resp.text)} chars")
     except Exception as e:
         print(f"    [COURIER] ✗ POST failed: {e}")
         return {"is_delivered": False, "status": "post_failed", "error": str(e)}
@@ -141,14 +148,16 @@ def check_courier(tracking_number: str) -> dict:
     result_soup = BeautifulSoup(resp.text, "html.parser")
     page_text   = result_soup.get_text(" ", strip=True)
 
-    # Step 3 — verify tracking number appears in the result
+    # ── Step 3: Verify tracking number appears in result ─────────────────────
     if tracking_number not in page_text:
-        print(f"    [COURIER] ✗ Tracking number not found in result page")
+        print(f"    [COURIER] ✗ Tracking number not found in result")
+        # Print snippet for debugging
+        print(f"    [COURIER] Page snippet: {page_text[:200]}")
         return {"is_delivered": False, "status": "not_found"}
 
     print(f"    [COURIER] ✓ Tracking number found in result")
 
-    # Step 4 — find "Current Status" column in summary table
+    # ── Step 4: Find "Current Status" column in summary table ─────────────────
     # Table structure: From | To | Current Status | Current Activity
     status_text = ""
     for table in result_soup.find_all("table"):
@@ -162,12 +171,12 @@ def check_courier(tracking_number: str) -> dict:
                     cells = rows[1].find_all("td")
                     if cells and si < len(cells):
                         status_text = cells[si].get_text(strip=True)
-                        print(f"    [COURIER] Current Status cell: '{status_text}'")
+                        print(f"    [COURIER] Current Status: '{status_text}'")
             except (ValueError, IndexError) as e:
                 print(f"    [COURIER] Table parse error: {e}")
             break
 
-    # Step 5 — fallback: scan text near the tracking number only
+    # ── Step 5: Fallback — scan text near tracking number only ────────────────
     if not status_text:
         idx = page_text.find(tracking_number)
         if idx != -1:
@@ -176,10 +185,10 @@ def check_courier(tracking_number: str) -> dict:
                       "dispatched", "picked up", "processing", "pending"]:
                 if k in nearby:
                     status_text = k.title()
-                    print(f"    [COURIER] Fallback status found: '{status_text}'")
+                    print(f"    [COURIER] Fallback status: '{status_text}'")
                     break
 
-    # Step 6 — exact match only (never partial/page-wide match)
+    # ── Step 6: Exact match only — never whole-page match ────────────────────
     is_delivered = status_text.strip().lower() in (
         "delivered", "delivery complete", "successfully delivered"
     )
@@ -201,7 +210,6 @@ def run_tracking():
         "details": []
     }
 
-    # Fetch only orders that actually need checking
     try:
         orders = get_orders_needing_delivery_check()
     except Exception as e:
@@ -232,7 +240,6 @@ def run_tracking():
                 "action":  None,
             }
 
-            # ── Condition 1: Delivery Status must not be delivered ────────────
             if shipment_status == "delivered":
                 msg = "skip — already delivered"
                 print(f"  → {msg}")
@@ -241,7 +248,6 @@ def run_tracking():
                 summary["details"].append(detail)
                 continue
 
-            # ── Condition 2: Carrier must be "Other" (Professional Courier) ───
             if tracking_company.lower() != "other":
                 msg = f"skip — carrier is '{tracking_company}' not 'Other'"
                 print(f"  → {msg}")
@@ -250,7 +256,6 @@ def run_tracking():
                 summary["details"].append(detail)
                 continue
 
-            # ── No tracking number ────────────────────────────────────────────
             if not tracking_number:
                 msg = "skip — no tracking number"
                 print(f"  → {msg}")
@@ -259,7 +264,6 @@ def run_tracking():
                 summary["details"].append(detail)
                 continue
 
-            # ── Both conditions met → check courier ───────────────────────────
             print(f"  → ✓ Conditions met — checking professionalcourier.ae...")
             summary["checked"] += 1
 
