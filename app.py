@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s %(message)s",
@@ -28,6 +29,7 @@ HEADERS = {
 def shopify(path):
     return f"https://{SHOPIFY_STORE}/admin/api/{API_VERSION}{path}"
 
+# ── Startup banner ────────────────────────────────────────────────────────────
 print("=" * 60)
 print("  DELIVERY TRACKER — STARTING")
 print(f"  Store : {SHOPIFY_STORE}")
@@ -35,13 +37,22 @@ print(f"  Token : {'SET ✓' if SHOPIFY_ACCESS_TOKEN else 'MISSING ✗'}")
 print("=" * 60)
 
 
-# ── 1. Fetch only orders needing delivery check ───────────────────────────────
+# ── 1. Fetch only orders that need delivery check ─────────────────────────────
+# Shopify REST API has no direct filter for Delivery Status (shipment_status).
+# So we fetch fulfilled orders, then filter in Python for:
+#   - shipment_status != 'delivered'  →  Delivery Status = 'Tracking added'
+#   - tracking_company == 'Other'     →  Professional Courier
+#   - tracking_number is not empty
 
 def get_orders_needing_delivery_check():
     print("\n[SHOPIFY] Fetching orders where Delivery Status = Tracking added...")
     all_orders = []
     url    = shopify("/orders.json")
-    params = {"fulfillment_status": "shipped", "status": "any", "limit": 250}
+    params = {
+        "fulfillment_status": "shipped",  # only fulfilled orders
+        "status":             "any",
+        "limit":              250,
+    }
 
     page = 0
     while url:
@@ -49,9 +60,12 @@ def get_orders_needing_delivery_check():
         print(f"  → Page {page}: GET {url}")
         r = requests.get(url, headers=HEADERS, params=params, timeout=30)
         r.raise_for_status()
+
         orders = r.json().get("orders", [])
         print(f"    Fetched {len(orders)} orders from Shopify")
 
+        # Filter: keep only orders with at least one fulfillment that
+        # needs a delivery check (not yet delivered + carrier Other + has AWB)
         for order in orders:
             needs_check = any(
                 (ful.get("shipment_status") or "") != "delivered"
@@ -64,6 +78,7 @@ def get_orders_needing_delivery_check():
 
         print(f"    {len(all_orders)} orders need delivery check so far")
 
+        # Cursor-based pagination via Link header
         link   = r.headers.get("Link", "")
         url    = None
         params = None
@@ -77,7 +92,7 @@ def get_orders_needing_delivery_check():
     return all_orders
 
 
-# ── 2. Mark Delivery Status = Delivered ──────────────────────────────────────
+# ── 2. Mark Delivery Status = Delivered in Shopify ───────────────────────────
 
 def mark_delivered(order_id, fulfillment_id):
     r = requests.post(
@@ -91,14 +106,12 @@ def mark_delivered(order_id, fulfillment_id):
 
 
 # ── 3. Scrape professionalcourier.ae ─────────────────────────────────────────
-# The site is WordPress-based. The tracking result is loaded via JavaScript
-# (AJAX) after page load — BeautifulSoup cannot see JS-rendered content.
-# Fix: POST directly to wp-admin/admin-ajax.php with common action names,
-# OR try GET with the tracking number in the URL query string,
-# OR try the REST API endpoint pattern.
+# Reads ONLY the "Current Status" table cell for the specific AWB.
+# Never reads whole page — prevents false positives.
 
 def check_courier(tracking_number: str) -> dict:
-    BASE = "https://professionalcourier.ae"
+    TRACKING_URL = "https://professionalcourier.ae/tracking/"
+    print(f"    [COURIER] Checking AWB {tracking_number}...")
 
     session = requests.Session()
     session.headers.update({
@@ -107,148 +120,61 @@ def check_courier(tracking_number: str) -> dict:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Referer":         f"{BASE}/tracking/",
-        "Accept":          "application/json, text/html, */*",
+        "Referer":         "https://professionalcourier.ae/",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
     })
 
-    print(f"    [COURIER] Checking AWB {tracking_number}...")
-
-    # ── Attempt 1: WordPress admin-ajax.php with common action names ──────────
-    ajax_url = f"{BASE}/wp-admin/admin-ajax.php"
-    actions  = [
-        "track_shipment", "shipment_tracking", "get_tracking",
-        "tracking_status", "track_order", "courier_tracking",
-        "get_shipment_status", "track", "awb_tracking",
-    ]
-
-    for action in actions:
-        try:
-            payload = {"action": action, "awb": tracking_number,
-                       "tracknumber": tracking_number, "TrackNo": tracking_number}
-            r = session.post(ajax_url, data=payload, timeout=15)
-            print(f"    [COURIER] admin-ajax action={action} → {r.status_code} ({len(r.text)} chars)")
-            if r.status_code == 200 and tracking_number in r.text and len(r.text) > 100:
-                print(f"    [COURIER] ✓ Got result from admin-ajax action={action}")
-                result = _parse_response(r.text, tracking_number)
-                if result["status"] != "unknown":
-                    return result
-        except Exception as e:
-            print(f"    [COURIER] admin-ajax error: {e}")
-
-    # ── Attempt 2: WordPress REST API ─────────────────────────────────────────
-    rest_urls = [
-        f"{BASE}/wp-json/tracking/v1/status/{tracking_number}",
-        f"{BASE}/wp-json/courier/v1/track/{tracking_number}",
-        f"{BASE}/wp-json/shipment/v1/track?awb={tracking_number}",
-    ]
-    for rest_url in rest_urls:
-        try:
-            r = session.get(rest_url, timeout=15)
-            print(f"    [COURIER] REST {rest_url} → {r.status_code}")
-            if r.status_code == 200 and tracking_number in r.text:
-                result = _parse_response(r.text, tracking_number)
-                if result["status"] != "unknown":
-                    return result
-        except Exception as e:
-            print(f"    [COURIER] REST error: {e}")
-
-    # ── Attempt 3: GET tracking page with AWB in query string ─────────────────
-    get_urls = [
-        f"{BASE}/tracking/?tracknumber={tracking_number}",
-        f"{BASE}/tracking/?awb={tracking_number}",
-        f"{BASE}/tracking/?TrackNo={tracking_number}",
-        f"{BASE}/tracking/{tracking_number}/",
-    ]
-    for get_url in get_urls:
-        try:
-            r = session.get(get_url, timeout=20)
-            print(f"    [COURIER] GET {get_url} → {r.status_code} ({len(r.text)} chars)")
-            if r.status_code == 200 and tracking_number in r.text:
-                print(f"    [COURIER] ✓ Tracking number found via GET")
-                result = _parse_response(r.text, tracking_number)
-                if result["status"] != "unknown":
-                    return result
-        except Exception as e:
-            print(f"    [COURIER] GET error: {e}")
-
-    # ── Attempt 4: Classic POST to /tracking/ (original method) ──────────────
-    # Load the page first to get any CSRF tokens, then POST
+    # Step 1 — load page (grab hidden CSRF fields)
     try:
-        page = session.get(f"{BASE}/tracking/", timeout=20)
-        soup = BeautifulSoup(page.text, "html.parser")
-        form_data = {}
-        form = soup.find("form")
-        if form:
-            for inp in form.find_all("input", {"type": "hidden"}):
-                if inp.get("name"):
-                    form_data[inp["name"]] = inp.get("value", "")
-            # Get the actual form action URL if set
-            action_url = form.get("action") or f"{BASE}/tracking/"
-            if not action_url.startswith("http"):
-                action_url = BASE + action_url
-        else:
-            action_url = f"{BASE}/tracking/"
-
-        # Fill all possible field names
-        for field in ("tracknumber", "TrackNo", "track_no", "awb_no",
-                      "awbno", "awb", "tracking_number", "number"):
-            form_data[field] = tracking_number
-
-        print(f"    [COURIER] POST to {action_url} with fields: {list(form_data.keys())}")
-        # Remove X-Requested-With for this request (it's a form POST, not AJAX)
-        post_headers = {k: v for k, v in session.headers.items()
-                        if k != "X-Requested-With"}
-        post_headers["Content-Type"] = "application/x-www-form-urlencoded"
-
-        resp = session.post(action_url, data=form_data,
-                            headers=post_headers, timeout=20)
-        print(f"    [COURIER] POST → {resp.status_code} ({len(resp.text)} chars)")
-
-        if tracking_number in resp.text:
-            print(f"    [COURIER] ✓ Tracking number found in POST response")
-            return _parse_response(resp.text, tracking_number)
-        else:
-            print(f"    [COURIER] ✗ Tracking number NOT in POST response")
-            # Save a snippet of the response for debugging
-            snippet = resp.text[:500].replace('\n', ' ')
-            print(f"    [COURIER] Response snippet: {snippet}")
-
+        page = session.get(TRACKING_URL, timeout=20)
+        page.raise_for_status()
+        print(f"    [COURIER] Page loaded OK (status {page.status_code})")
     except Exception as e:
-        print(f"    [COURIER] POST error: {e}")
+        print(f"    [COURIER] ✗ Site unreachable: {e}")
+        return {"is_delivered": False, "status": "unreachable", "error": str(e)}
 
-    print(f"    [COURIER] ✗ All attempts failed for AWB {tracking_number}")
-    return {"is_delivered": False, "status": "not_found"}
+    soup      = BeautifulSoup(page.text, "html.parser")
+    form_data = {}
+    form      = soup.find("form")
+    if form:
+        for inp in form.find_all("input", {"type": "hidden"}):
+            if inp.get("name"):
+                form_data[inp["name"]] = inp.get("value", "")
+        print(f"    [COURIER] Form found, hidden fields: {list(form_data.keys())}")
+    else:
+        print(f"    [COURIER] No form found on page")
 
+    # Try every common field name the form might use
+    for field in ("tracknumber", "TrackNo", "track_no", "awb_no",
+                  "awbno", "awb", "tracking_number", "number"):
+        form_data[field] = tracking_number
 
-def _parse_response(html_or_json: str, tracking_number: str) -> dict:
-    """
-    Parse courier site response.
-    Handles both JSON responses (from AJAX/REST) and HTML responses.
-    Reads ONLY the 'Current Status' cell — never the whole page.
-    """
-    # ── Try JSON first ────────────────────────────────────────────────────────
+    # Step 2 — POST the tracking form
     try:
-        import json
-        data = json.loads(html_or_json)
-        text = str(data).lower()
-        print(f"    [COURIER] JSON response: {str(data)[:200]}")
-        is_delivered = "delivered" in text
-        status = "Delivered" if is_delivered else "In Transit"
-        return {"is_delivered": is_delivered, "status": status}
-    except Exception:
-        pass
+        resp = session.post(TRACKING_URL, data=form_data, timeout=20)
+        resp.raise_for_status()
+        print(f"    [COURIER] POST response: {resp.status_code} ({len(resp.text)} chars)")
+    except Exception as e:
+        print(f"    [COURIER] ✗ POST failed: {e}")
+        return {"is_delivered": False, "status": "post_failed", "error": str(e)}
 
-    # ── Parse as HTML ─────────────────────────────────────────────────────────
-    soup      = BeautifulSoup(html_or_json, "html.parser")
-    page_text = soup.get_text(" ", strip=True)
+    result_soup = BeautifulSoup(resp.text, "html.parser")
+    page_text   = result_soup.get_text(" ", strip=True)
+
+    # Step 3 — verify tracking number appears in the result
+    if tracking_number not in page_text:
+        print(f"    [COURIER] ✗ Tracking number not found in result page")
+        return {"is_delivered": False, "status": "not_found"}
+
+    print(f"    [COURIER] ✓ Tracking number found in result")
+
+    # Step 4 — find "Current Status" column in summary table
+    # Table structure: From | To | Current Status | Current Activity
     status_text = ""
-
-    # Find the summary table: From | To | Current Status | Current Activity
-    for table in soup.find_all("table"):
+    for table in result_soup.find_all("table"):
         headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-        print(f"    [COURIER] Table headers found: {headers}")
+        print(f"    [COURIER] Table headers: {headers}")
         if "current status" in headers:
             try:
                 si   = headers.index("current status")
@@ -262,7 +188,7 @@ def _parse_response(html_or_json: str, tracking_number: str) -> dict:
                 print(f"    [COURIER] Table parse error: {e}")
             break
 
-    # Fallback: scan 400 chars after tracking number only
+    # Step 5 — fallback: scan text near the tracking number only
     if not status_text:
         idx = page_text.find(tracking_number)
         if idx != -1:
@@ -271,12 +197,14 @@ def _parse_response(html_or_json: str, tracking_number: str) -> dict:
                       "dispatched", "picked up", "processing", "pending"]:
                 if k in nearby:
                     status_text = k.title()
-                    print(f"    [COURIER] Fallback status: '{status_text}'")
+                    print(f"    [COURIER] Fallback status found: '{status_text}'")
                     break
 
+    # Step 6 — exact match only (never partial/page-wide match)
     is_delivered = status_text.strip().lower() in (
         "delivered", "delivery complete", "successfully delivered"
     )
+
     print(f"    [COURIER] Final → status='{status_text}' is_delivered={is_delivered}")
     return {"is_delivered": is_delivered, "status": status_text or "unknown"}
 
@@ -288,8 +216,13 @@ def run_tracking():
     print("  RUN TRACKING STARTED")
     print("=" * 60)
 
-    summary = {"checked": 0, "updated": 0, "errors": 0, "skipped": 0, "details": []}
+    summary = {
+        "checked": 0, "updated": 0,
+        "errors":  0, "skipped": 0,
+        "details": []
+    }
 
+    # Fetch only orders that actually need checking
     try:
         orders = get_orders_needing_delivery_check()
     except Exception as e:
@@ -312,49 +245,71 @@ def run_tracking():
             print(f"\n  Order #{order_number} | AWB: {tracking_number} | "
                   f"Carrier: {tracking_company} | Status: {shipment_status}")
 
-            detail = {"order": order_number, "awb": tracking_number,
-                      "carrier": tracking_company, "status": shipment_status,
-                      "action": None}
+            detail = {
+                "order":   order_number,
+                "awb":     tracking_number,
+                "carrier": tracking_company,
+                "status":  shipment_status,
+                "action":  None,
+            }
 
+            # ── Condition 1: Delivery Status must not be delivered ────────────
             if shipment_status == "delivered":
-                detail["action"] = "skip — already delivered"
+                msg = "skip — already delivered"
+                print(f"  → {msg}")
+                detail["action"] = msg
                 summary["skipped"] += 1
                 summary["details"].append(detail)
                 continue
 
+            # ── Condition 2: Carrier must be "Other" (Professional Courier) ───
             if tracking_company.lower() != "other":
-                detail["action"] = f"skip — carrier '{tracking_company}'"
+                msg = f"skip — carrier is '{tracking_company}' not 'Other'"
+                print(f"  → {msg}")
+                detail["action"] = msg
                 summary["skipped"] += 1
                 summary["details"].append(detail)
                 continue
 
+            # ── No tracking number ────────────────────────────────────────────
             if not tracking_number:
-                detail["action"] = "skip — no tracking number"
+                msg = "skip — no tracking number"
+                print(f"  → {msg}")
+                detail["action"] = msg
                 summary["skipped"] += 1
                 summary["details"].append(detail)
                 continue
 
+            # ── Both conditions met → check courier ───────────────────────────
             print(f"  → ✓ Conditions met — checking professionalcourier.ae...")
             summary["checked"] += 1
 
             courier = check_courier(tracking_number)
 
             if courier.get("error"):
-                detail["action"] = f"error: {courier['error']}"
+                msg = f"error: {courier['error']}"
+                print(f"  → ✗ {msg}")
+                detail["action"] = msg
                 summary["errors"] += 1
-            elif courier["is_delivered"]:
+                summary["details"].append(detail)
+                continue
+
+            if courier["is_delivered"]:
                 try:
                     mark_delivered(order_id, ful_id)
-                    detail["action"] = "✅ MARKED DELIVERED in Shopify"
+                    msg = "✅ MARKED DELIVERED in Shopify"
+                    print(f"  → {msg}")
+                    detail["action"] = msg
                     summary["updated"] += 1
-                    print(f"  → ✅ MARKED DELIVERED")
                 except Exception as e:
-                    detail["action"] = f"Shopify update failed: {e}"
+                    msg = f"Shopify update failed: {e}"
+                    print(f"  → ✗ {msg}")
+                    detail["action"] = msg
                     summary["errors"] += 1
-                    print(f"  → ✗ Shopify update failed: {e}")
             else:
-                detail["action"] = f"not delivered yet (courier: {courier['status']})"
-                print(f"  → not delivered yet: {courier['status']}")
+                msg = f"not delivered yet (courier: {courier['status']})"
+                print(f"  → {msg}")
+                detail["action"] = msg
 
             summary["details"].append(detail)
 
@@ -365,6 +320,7 @@ def run_tracking():
     print(f"  Skipped : {summary['skipped']}")
     print(f"  Errors  : {summary['errors']}")
     print("=" * 60 + "\n")
+
     return summary
 
 
@@ -372,13 +328,21 @@ def run_tracking():
 
 @app.route("/check-tracking", methods=["POST", "GET"])
 def check_tracking():
-    print(f"\n>>> /check-tracking triggered")
-    summary = run_tracking()
-    return jsonify({"ok": True, "summary": summary}), 200
+    """
+    Called by Shopify Flow at 9am and 6pm IST.
+    Responds immediately to avoid Flow's 30-second timeout.
+    Tracking runs in background — check Render logs for results.
+    """
+    import threading
+    print(f"\n>>> /check-tracking triggered — starting background job")
+    thread = threading.Thread(target=run_tracking, daemon=True)
+    thread.start()
+    return jsonify({"ok": True, "message": "Tracking job started in background"}), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
+    """Ping this every 14 min from UptimeRobot to keep Render awake."""
     print(">>> GET /health — OK")
     return jsonify({"status": "ok", "store": SHOPIFY_STORE}), 200
 
@@ -389,7 +353,7 @@ def index():
         "service":   "Delivery Sync — Fragrant Souq",
         "endpoints": {
             "POST /check-tracking": "Run tracking (called by Shopify Flow)",
-            "GET  /health":         "Health check",
+            "GET  /health":         "Health check for uptime monitors",
         }
     }), 200
 
