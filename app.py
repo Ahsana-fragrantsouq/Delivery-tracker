@@ -110,7 +110,10 @@ def mark_delivered(order_id, fulfillment_id):
 # Never reads whole page — prevents false positives.
 
 def check_courier(tracking_number: str) -> dict:
-    TRACKING_URL = "https://professionalcourier.ae/tracking/"
+    # Confirmed from browser DevTools:
+    # Form action : https://professionalcourier.ae/tracking  (POST)
+    # Field name  : trackno
+    TRACKING_URL = "https://professionalcourier.ae/tracking"
     print(f"    [COURIER] Checking AWB {tracking_number}...")
 
     session = requests.Session()
@@ -120,39 +123,15 @@ def check_courier(tracking_number: str) -> dict:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Referer":         "https://professionalcourier.ae/",
+        "Referer":         "https://professionalcourier.ae/tracking",
+        "Origin":          "https://professionalcourier.ae",
         "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     })
 
-    # Step 1 — load page (grab hidden CSRF fields)
+    # POST with confirmed field name "trackno"
     try:
-        page = session.get(TRACKING_URL, timeout=20)
-        page.raise_for_status()
-        print(f"    [COURIER] Page loaded OK (status {page.status_code})")
-    except Exception as e:
-        print(f"    [COURIER] ✗ Site unreachable: {e}")
-        return {"is_delivered": False, "status": "unreachable", "error": str(e)}
-
-    soup      = BeautifulSoup(page.text, "html.parser")
-    form_data = {}
-    form      = soup.find("form")
-    if form:
-        for inp in form.find_all("input", {"type": "hidden"}):
-            if inp.get("name"):
-                form_data[inp["name"]] = inp.get("value", "")
-        print(f"    [COURIER] Form found, hidden fields: {list(form_data.keys())}")
-    else:
-        print(f"    [COURIER] No form found on page")
-
-    # Try every common field name the form might use
-    for field in ("tracknumber", "TrackNo", "track_no", "awb_no",
-                  "awbno", "awb", "tracking_number", "number"):
-        form_data[field] = tracking_number
-
-    # Step 2 — POST the tracking form
-    try:
-        resp = session.post(TRACKING_URL, data=form_data, timeout=20)
+        resp = session.post(TRACKING_URL, data={"trackno": tracking_number}, timeout=20)
         resp.raise_for_status()
         print(f"    [COURIER] POST response: {resp.status_code} ({len(resp.text)} chars)")
     except Exception as e:
